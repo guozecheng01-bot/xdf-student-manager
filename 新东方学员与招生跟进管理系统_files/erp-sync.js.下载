@@ -1,0 +1,108 @@
+/* Local report bridge. Source data and ERP credentials are never sent to a server. */
+(function () {
+  'use strict';
+  const STORE='xdf_erp_sync_v1', BACKUP='xdf_erp_before_sync_backup';
+  const KEYS=['xdf_students','xdf_records','xdf_schedules','xdf_teachers','xdf_appointments','xdf_dingtalk_config','xdf_biz_config','xdf_prospects',STORE];
+  let saved=readSaved(), pending=null, fileHandle=null, timer=null, reading=false, watching=false, generation=0, changedInOtherTab=false;
+  const el=id=>document.getElementById(id);
+  const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmt=v=>v===null||v===undefined?'未提供':Number(v).toLocaleString('zh-CN',{maximumFractionDigits:4});
+  const date=v=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'尚未同步';
+  function readSaved(){try{const v=JSON.parse(localStorage.getItem(STORE)||'null');return v?.version===1&&Array.isArray(v.snapshot?.rows)&&Array.isArray(v.snapshot?.groups)?v:null;}catch(_){return null;}}
+  function message(text,error=false){el('erp-message').textContent=text;el('erp-message').dataset.error=String(error);}
+  function names(snapshot){return snapshot.groups.map(g=>g.name).sort();}
+  function balances(snapshot){
+    const set=new Set(names(snapshot)), roster=students.filter(s=>set.has(String(s.name).trim())), ids=new Set(roster.map(s=>String(s.id)));
+    const relevant=row=>ids.has(String(row.studentId))||set.has(String(row.studentName||'').trim());
+    return JSON.stringify({students:roster.map(s=>({id:s.id,name:String(s.name).trim(),total:s.totalHours,used:s.consumedHours,scheduled:s.scheduledHours??null,unscheduled:s.unscheduledHours??null,hoursLedger:s.hoursLedger??null})).sort((a,b)=>a.name.localeCompare(b.name)),schedules:schedules.filter(relevant),records:records.filter(relevant)});
+  }
+  function plan(snapshot){if(changedInOtherTab)throw new Error('另一标签页已更新学员数据，请刷新此页面后再同步。');return XdfErpCore.planMerge(snapshot,students,{allowNameMatch:true,syncedAt:new Date().toISOString()});}
+  function metrics(snapshot){const t=snapshot.totals;return [['姓名数',t.studentCount,'按姓名汇总'],['课时包数',t.packageCount,'保留逐包明细'],['总课时',t.totalHours,'课时数'],['已上课时',t.consumedHours,'已派已上'],['剩余课时',t.remainingHours,'总课时 − 已上'],['未排课时',t.unscheduledHours,'尚未排课']].map(([label,value,hint])=>`<div class="erp-metric"><span>${label}</span><strong>${fmt(value)}</strong><small>${hint}</small></div>`).join('');}
+  function render(){
+    el('erp-session-status').dataset.active=String(watching);el('erp-session-status').textContent=watching?'正在检查文件更新':'本地报表同步';
+    el('erp-watch-stop').disabled=!watching;el('erp-file-name').textContent=saved?.snapshot.source.fileName||'未选择报表';
+    el('erp-last-sync').textContent=date(saved?.syncedAt);el('erp-file-date').textContent=saved?date(saved.snapshot.source.modifiedAt):'未读取';
+    el('erp-watch-status').textContent=watching?'每 30 秒检查已关联文件；页面关闭后停止':'未开启；重新打开页面后需重新关联文件';
+    el('erp-backup').disabled=!localStorage.getItem(BACKUP);el('erp-preview').classList.toggle('erp-hide',!pending);
+    if(pending){
+      const s=pending.snapshot;el('erp-preview-metrics').innerHTML=metrics(s);el('erp-preview-file').textContent=`${s.source.fileName} · ${s.source.sheetName}`;
+      el('erp-preview-summary').textContent=`将更新 ${pending.plan.summary.updatedStudents+pending.plan.summary.unchangedStudents} 位、新增 ${pending.plan.summary.newStudents} 位。报表外的学员继续保留。${pending.handle?'确认后开始检查此文件的后续更新。':''}`;
+      el('erp-preview-warnings').innerHTML='<ul>'+s.warnings.map(w=>`<li>${esc(w.message)}</li>`).join('')+'<li>已有画像、备注、老师、电话、跟进记录及排课历史保留。本次报表的累计余额将设为新老账，导入前的新账归档；现有排课与流水不会重复计入。</li><li>没有学员唯一编号时按姓名匹配；同名不同人需先核对，不能可靠区分。</li></ul>';
+      const oldMap=new Map(students.map(s=>[String(s.name).trim(),s]));
+      el('erp-preview-rows').innerHTML=s.groups.map(g=>{const old=oldMap.get(g.name);return `<tr><td>${esc(g.name)}</td><td><span class="erp-tag">${old?'更新':'新增'}</span></td><td class="erp-num">${g.packages.length}</td><td class="erp-num">${old?fmt(old.totalHours)+' → ':''}${fmt(g.totalHours)}</td><td class="erp-num">${old?fmt(old.consumedHours)+' → ':''}${fmt(g.consumedHours)}</td><td class="erp-num">${fmt(g.remainingHours)}</td><td class="erp-num">${fmt(g.unscheduledHours)}</td></tr>`;}).join('');
+      el('erp-apply').disabled=!el('erp-name-confirm').checked;
+    }
+    el('erp-snapshot').classList.toggle('erp-hide',!saved);
+    if(saved){el('erp-current-metrics').innerHTML=metrics(saved.snapshot);const t=saved.snapshot.totals;el('erp-current-note').textContent=`已排 ${fmt(t.scheduledHours)}，其中已排未上 ${fmt(t.pendingScheduledHours)}。金额按源报表保留：总课时费 ${fmt(t.totalFee)} 元，剩余课时费 ${fmt(t.remainingFee)} 元。${!t.totalFeeComplete||!t.remainingFeeComplete?'部分金额未提供，所示金额只含已提供部分。':''}`;renderPackages();}
+    el('erp-history').innerHTML=(saved?.history||[]).slice(0,8).map(h=>`<li>${esc(date(h.at))} · ${h.auto?'文件自动更新':'确认同步'} · ${esc(h.fileName)} · ${fmt(h.packages)} 个课包 / ${fmt(h.names)} 个姓名</li>`).join('')||'<li>尚无同步记录。</li>';
+  }
+  function renderPackages(){
+    if(!saved)return;const q=el('erp-search').value.trim().toLowerCase(), rows=saved.snapshot.rows.filter(r=>[r.studentName,r.productName,r.intendedSubjects,r.departmentName].join(' ').toLowerCase().includes(q));
+    el('erp-package-count').textContent=`${rows.length} 条课包明细`;
+    el('erp-package-rows').innerHTML=rows.length?rows.map(r=>`<tr><td>${esc(r.studentName)}</td><td>${esc(r.productName)}</td><td>${esc(r.intendedSubjects)}</td><td class="erp-num">${fmt(r.totalHours)}</td><td class="erp-num">${fmt(r.scheduledHours)}</td><td class="erp-num">${fmt(r.unscheduledHours)}</td><td class="erp-num">${fmt(r.consumedHours)}</td><td class="erp-num">${fmt(r.remainingHours)}</td><td class="erp-num">${fmt(r.remainingFee)}</td><td class="erp-num">${esc(r.sourceRow)}</td></tr>`).join(''):'<tr><td colspan="10" class="erp-empty">没有匹配的课包。</td></tr>';
+  }
+  function looksERP(matrix){return matrix.slice(0,20).some(row=>{const h=row.map(v=>String(v??'').replace(/\s/g,''));return(h.includes('学生姓名')||h.includes('学员姓名'))&&h.some(v=>['已派已上','剩余课时数','总课时费'].includes(v));});}
+  async function readFile(file,optional=false){
+    if(!window.XLSX)throw new Error('Excel 读取组件尚未加载，请检查网络后重试。');if(file.size>25*1024*1024)throw new Error('报表超过 25 MB，请仅导出需要同步的课包明细。');
+    const wb=XLSX.read(new Uint8Array(await file.arrayBuffer()),{type:'array'}), sheetNames=[...wb.SheetNames].sort((a,b)=>Number(b==='学生明细')-Number(a==='学生明细'));
+    for(const name of sheetNames){const matrix=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:null,blankrows:true});if(looksERP(matrix))return XdfErpCore.parseMatrix(matrix,{sheetName:name,fileName:file.name,modifiedAt:new Date(file.lastModified).toISOString()});}
+    if(optional)return null;throw new Error('未找到 ERP 课包明细。报表需含学生姓名、课时数、已派、未排、已派已上、剩余课时数；支持“学生明细”工作表。');
+  }
+  function preview(snapshot,handle=null,reason=''){pending={snapshot,plan:plan(snapshot),handle,baseline:balances(snapshot)};el('erp-name-confirm').checked=false;switchTab('erp');render();message(reason||'已读取报表，请核对预览后确认同步。');}
+  async function chooseWatch(){
+    if(!window.showOpenFilePicker||!window.isSecureContext){message('此浏览器不支持关联文件自动检查。请使用 Chrome / Edge 打开本站，或使用“选择报表”手动同步。',true);return;}
+    try{const[handle]=await window.showOpenFilePicker({multiple:false,types:[{description:'Excel 课包报表',accept:{'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':['.xlsx'],'application/vnd.ms-excel':['.xls'],'text/csv':['.csv']}}]});const snapshot=await readFile(await handle.getFile());stopWatch(false);preview(snapshot,handle);}catch(e){if(e.name!=='AbortError')message('关联失败：'+e.message,true);}
+  }
+  async function importSelected(event){const file=event.target.files?.[0];if(!file)return;try{const snapshot=await readFile(file);stopWatch(false);preview(snapshot);}catch(e){message('报表未同步：'+e.message,true);}finally{event.target.value='';}}
+  function commit(snapshot,auto=false){
+    const nextPlan=plan(snapshot), prior=structuredClone(students), previous=saved, old=new Map(KEYS.map(k=>[k,localStorage.getItem(k)])), syncedAt=new Date().toISOString();
+    const next={version:1,snapshot,syncedAt,history:[{at:syncedAt,auto,fileName:snapshot.source.fileName,packages:snapshot.totals.packageCount,names:snapshot.totals.studentCount},...(saved?.history||[])].slice(0,20)};
+    try{localStorage.setItem(BACKUP,JSON.stringify({...appBackupData(),erpSync:previous}));students=nextPlan.students;if(typeof hoursRebaseImported==='function')hoursRebaseImported(students,'ERP 报表',new Set(snapshot.groups.map(g=>g.name)));if(typeof normalizeCRMRecord==='function')students.forEach(s=>normalizeCRMRecord(s));persist();next.baseline=balances(snapshot);localStorage.setItem(STORE,JSON.stringify(next));saved=next;}
+    catch(e){students=prior;saved=previous;for(const[k,v]of old){try{if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,v);}catch(_){}}try{updateAllViews();}catch(_){}throw new Error('保存失败，已尝试恢复同步前数据。请下载备份并检查浏览器存储空间。'+e.message);}
+    return nextPlan;
+  }
+  function applyPreview(){
+    if(!pending||!el('erp-name-confirm').checked)return;
+    try{if(balances(pending.snapshot)!==pending.baseline){const p=pending;preview(p.snapshot,p.handle,'预览后本地课时有改动，已重新计算。请再次核对并确认。');return;}
+      const p=pending;commit(p.snapshot);pending=null;if(p.handle)startWatch(p.handle);else stopWatch(false);render();document.querySelector('main').scrollTop=0;message(`同步完成：${fmt(saved.snapshot.totals.packageCount)} 个课包、${fmt(saved.snapshot.totals.studentCount)} 个姓名。${watching?'文件更新将自动检查；本地课时有改动时会暂停并要求核对。':''}`);
+    }catch(e){stopWatch(false);render();message(e.message,true);}
+  }
+  function stopWatch(announce=true){clearInterval(timer);timer=null;watching=false;fileHandle=null;generation++;if(el('erp-session-status'))render();if(announce)message('已停止检查文件更新。已同步的数据保留。');}
+  function startWatch(handle){stopWatch(false);fileHandle=handle;watching=true;timer=setInterval(checkFile,30000);}
+  async function checkFile(){
+    if(!watching||!fileHandle||reading||document.hidden)return;reading=true;const version=generation, handle=fileHandle;
+    try{const file=await handle.getFile();if(version!==generation||!watching)return;if(file.name===saved?.snapshot.source.fileName&&new Date(file.lastModified).toISOString()===saved?.snapshot.source.modifiedAt)return;
+      const snapshot=await readFile(file);if(version!==generation||!watching)return;
+      if(JSON.stringify(snapshot.rows)===JSON.stringify(saved.snapshot.rows)){const next={...saved,snapshot};localStorage.setItem(STORE,JSON.stringify(next));saved=next;render();return;}
+      const localChange=balances(saved.snapshot)!==saved.baseline, coverageChange=JSON.stringify(names(snapshot))!==JSON.stringify(names(saved.snapshot))||snapshot.rows.length!==saved.snapshot.rows.length;
+      if(localChange||coverageChange||pending){stopWatch(false);preview(snapshot,handle,localChange?'本地课时在上次同步后发生变化，自动更新已暂停。请核对 ERP 报表与本地课消后确认。':'报表名单或课包数量有变化，自动更新已暂停。请核对本次同步范围。');return;}
+      commit(snapshot,true);render();message('已根据关联文件的新版本自动更新。');
+    }catch(e){if(version===generation){stopWatch(false);message('自动更新已暂停，旧数据保留：'+e.message,true);}}finally{reading=false;}
+  }
+  function install(){
+    const css=document.createElement('link');css.rel='stylesheet';css.href='erp-sync.css';document.head.appendChild(css);
+    const nav=document.createElement('button');nav.type='button';nav.id='nav-erp';nav.className='w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:bg-slate-800 transition-all';nav.textContent='↻ ERP 数据同步';nav.addEventListener('click',()=>switchTab('erp'));el('nav-students').after(nav);
+    const section=document.createElement('section');section.id='tab-erp';section.className='erp-page hidden';section.innerHTML=`
+      <div class="erp-head"><div><h2>ERP 数据同步</h2><p class="erp-help">从课时包报表更新学员课时，并保留维护档案。支持关联本地文件，自动检查后续更新。</p></div><span class="erp-status" id="erp-session-status">本地报表同步</span></div>
+      <div class="erp-card"><div class="erp-line"><h3>连接课时包报表</h3><span class="erp-status">ERP 实时直连尚未接通</span></div>
+      <p class="erp-help">先从新东方 ERP 导出含“学生明细”的报表，再选择文件。关联后，每 30 秒检查文件是否更新；ERP 里的变更仍需导出并保存到同一文件。关闭此页面后检查停止。</p>
+      <div class="erp-actions"><button class="erp-btn erp-primary" id="erp-select">选择报表</button><button class="erp-btn" id="erp-watch-select">关联文件并自动检查</button><button class="erp-btn" id="erp-watch-stop" disabled>停止自动检查</button><a class="erp-btn" href="https://erp.xdf.cn/vipnis/service/lesson-hour" target="_blank" rel="noopener noreferrer">打开 ERP 课时包管理 ↗</a></div><input type="file" id="erp-file-input" accept=".xlsx,.xls,.csv" hidden>
+      <dl class="erp-meta"><div><dt>上次同步文件</dt><dd id="erp-file-name"></dd></div><div><dt>同步时间</dt><dd id="erp-last-sync"></dd></div><div><dt>文件修改时间</dt><dd id="erp-file-date"></dd></div></dl><p class="erp-help" id="erp-watch-status"></p><div class="erp-message" id="erp-message" role="status" aria-live="polite"></div></div>
+      <div class="erp-card erp-hide" id="erp-preview"><div class="erp-line"><h3>确认本次同步</h3><span class="erp-help" id="erp-preview-file"></span></div><div class="erp-metrics" id="erp-preview-metrics"></div><p class="erp-help" id="erp-preview-summary"></p><div class="erp-note" id="erp-preview-warnings"></div>
+      <div class="erp-table-wrap"><table class="erp-table"><thead><tr><th>学员姓名</th><th>处理</th><th>课包数</th><th>总课时：当前 → 报表</th><th>已上课时：当前 → 报表</th><th>剩余课时</th><th>未排课时</th></tr></thead><tbody id="erp-preview-rows"></tbody></table></div>
+      <label class="erp-check"><input id="erp-name-confirm" type="checkbox"><span>我已核对按姓名匹配的名单和课时，确认同名记录属于同一学员，并以本报表的累计余额重建老账、归档原新账。</span></label><div class="erp-actions"><button class="erp-btn erp-primary" id="erp-apply" disabled>确认同步到学员与看板</button><button class="erp-btn" id="erp-cancel">取消本次同步</button></div></div>
+      <div class="erp-card erp-hide" id="erp-snapshot"><div class="erp-line"><h3>最近同步的课包快照</h3><span class="erp-help" id="erp-package-count"></span></div><div class="erp-metrics" id="erp-current-metrics"></div><p class="erp-help" id="erp-current-note"></p><div class="erp-line" style="margin:16px 0"><p class="erp-help">此处为源报表数据；之后的本地课消请在学员看板查看。</p><input id="erp-search" class="erp-search" aria-label="搜索 ERP 课包" placeholder="搜索姓名、产品或科目"></div>
+      <div class="erp-table-wrap"><table class="erp-table"><thead><tr><th>姓名</th><th>产品名称</th><th>意向科目</th><th>总课时</th><th>已排</th><th>未排</th><th>已上</th><th>剩余</th><th>剩余课时费 / 元</th><th>源行</th></tr></thead><tbody id="erp-package-rows"></tbody></table></div></div>
+      <div class="erp-card"><div class="erp-line"><h3>同步记录与备份</h3><button class="erp-btn" id="erp-backup" disabled>下载最近同步前备份</button></div><ul class="erp-history" id="erp-history"></ul></div><p class="erp-bottom-note">报表仅在当前浏览器读取与保存。不会上传 ERP 登录信息或将报表发布到网站源码。已有本地课时变化、名单变化或报表校验失败时，自动更新会暂停。</p>`;
+    document.querySelector('main').appendChild(section);const originalSwitch=switchTab;switchTab=function(tab){originalSwitch(tab);section.classList.toggle('hidden',tab!=='erp');nav.classList.toggle('bg-blue-600',tab==='erp');nav.classList.toggle('text-white',tab==='erp');nav.classList.toggle('text-slate-300',tab!=='erp');nav.classList.toggle('hover:bg-slate-800',tab!=='erp');if(tab==='erp')document.querySelector('main').scrollTop=0;};
+    el('erp-select').addEventListener('click',()=>el('erp-file-input').click());el('erp-file-input').addEventListener('change',importSelected);el('erp-watch-select').addEventListener('click',chooseWatch);el('erp-watch-stop').addEventListener('click',()=>stopWatch());el('erp-apply').addEventListener('click',applyPreview);el('erp-name-confirm').addEventListener('change',()=>{el('erp-apply').disabled=!el('erp-name-confirm').checked;});el('erp-cancel').addEventListener('click',()=>{pending=null;render();message('已取消本次同步。');});el('erp-search').addEventListener('input',renderPackages);
+    el('erp-backup').addEventListener('click',()=>{try{const v=JSON.parse(localStorage.getItem(BACKUP));if(v)appDownloadJSON(v,'XDF_ERP同步前备份.json');}catch(e){message('备份读取失败：'+e.message,true);}});
+    const legacyImport=handleExcelImport;handleExcelImport=async function(event){const file=event.target.files?.[0];if(!file)return;try{const s=await readFile(file,true);if(s){stopWatch(false);preview(s);event.target.value='';}else await legacyImport(event);}catch(e){switchTab('erp');message('报表未同步：'+e.message,true);event.target.value='';}};
+    render();
+    window.addEventListener('storage',event=>{if(event.key===null||KEYS.includes(event.key)){changedInOtherTab=true;stopWatch(false);pending=null;render();message('另一标签页已更新系统数据，文件自动更新已暂停。请刷新此页面后再同步。',true);}});
+  }
+  globalThis.erpGetSyncState=()=>saved?structuredClone(saved):null;
+  globalThis.erpRestoreSyncState=function(value){stopWatch(false);pending=null;if(value?.version===1&&Array.isArray(value.snapshot?.rows)&&Array.isArray(value.snapshot?.groups)){localStorage.setItem(STORE,JSON.stringify(value));saved=structuredClone(value);}else{localStorage.removeItem(STORE);saved=null;}render();};
+  globalThis.XdfErpSync={readFile,preview,applyPreview,checkFile,stopWatch,getState:()=>({saved,pending,watching})};
+  install();
+})();

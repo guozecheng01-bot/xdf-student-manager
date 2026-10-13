@@ -1,0 +1,143 @@
+/* Daily report: summary plus the full unscheduled appointment appendix. */
+'use strict';
+let dailyReportSending = false;
+let dailyReportAutoProgress = null;
+let dailyReportLastAutoAttempt = 0;
+function dailyReportNow() {
+  const parts = new Intl.DateTimeFormat('sv-SE', {timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date());
+  const value = type => parts.find(p=>p.type===type)?.value || '';
+  return {date:`${value('year')}-${value('month')}-${value('day')}`,time:`${value('hour')}:${value('minute')}`};
+}
+function dailyReportEscape(value) {
+  return String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/[\\`*_\[\]#|]/g,'\\$&');
+}
+function dailyReportRows() { return typeof getPendingSchedulingRows === 'function' ? getPendingSchedulingRows() : []; }
+function dailyReportKeyword() { return String(dingTalkConfig.keyword || '课消').replace(/[\r\n]/g,' '); }
+function dailyReportDetailBlocks(rows) {
+  return rows.map((r,i) => `#### ${i+1}. ${dailyReportEscape(r.studentName)}${r.isGift ? '（赠送）' : ''}\n`+
+    `- **课程**：${dailyReportEscape(r.course || '待补充')}\n`+
+    `- **老师**：${dailyReportEscape(r.teacher || '待分配')}\n`+
+    `- **课时**：${Number(r.hours || 0)} h\n`+
+    `- **未排/未约原因**：${dailyReportEscape(r.unscheduledReason || '尚未填写，请教务补充')}\n`+
+    `- **预约情况**：${dailyReportEscape(r.status || '待确认')}；${dailyReportEscape(r.date || '日期待协商')}；${dailyReportEscape(r.timeRange || '时间待协商')}\n`+
+    `- **后续安排**：${dailyReportEscape(r.nextAction || '待补充')}\n`+
+    `- **下次跟进**：${dailyReportEscape(r.followupDate || '未设置')}`);
+}
+function dailyReportSplitBlocks(blocks, maxBytes = 6000) {
+  const encoder = new TextEncoder();
+  const pages = []; let current = '';
+  const add = chunk => {
+    const candidate=current ? current+'\n\n'+chunk : chunk;
+    if (encoder.encode(candidate).length>maxBytes && current) {pages.push(current);current=chunk;} else current=candidate;
+  };
+  for(const block of blocks) {
+    if(encoder.encode(block).length<=maxBytes){add(block);continue;}
+    let segment='';let bytes=0;
+    for(const character of block){const length=encoder.encode(character).length;if(bytes+length>maxBytes){add(segment);segment='';bytes=0;}segment+=character;bytes+=length;}
+    if(segment)add(segment);
+  }
+  if(current)pages.push(current);
+  return pages;
+}
+function buildDingTalkPendingSchedulingPayloads(rows = dailyReportRows()) {
+  const hours=rows.reduce((n,r)=>n+Number(r.hours||0),0);
+  const blocks=rows.length ? dailyReportDetailBlocks(rows) : ['当前没有已预约但尚未排课的学员需求。'];
+  const pages=dailyReportSplitBlocks(blocks);
+  return pages.map((text,index)=>({msgtype:'markdown',markdown:{
+    title:`【已预约未排课明细】${index+1}/${pages.length}`,
+    text:`### 📋 【已预约未排课明细】（${index+1}/${pages.length}）\n\n`+
+      `> ${dailyReportKeyword()} · ${dailyReportNow().date} · 共 ${rows.length} 单 / ${new Set(rows.map(r=>r.studentId||r.studentName)).size} 名学员 / ${hours} h\n\n`+
+      text+'\n\n*仅包含未取消、尚未转入正式排课的预约；赠送为学员标签。*'
+  }}));
+}
+function buildDingTalkDailyReportPayloads() {
+  const stats=getSummaryStats(), rows=dailyReportRows();
+  const include=dingTalkConfig.includePendingScheduling !== false;
+  const hours=rows.reduce((sum,r)=>sum+Number(r.hours||0),0);
+  const giftCount=students.filter(s=>s.isGift===true).length;
+  const title='【新东方一对一课消实时大盘日报】';
+  const text=`### 📊 ${title}\n\n> ${dailyReportKeyword()}\n\n`+
+    `- **学员总数**：${stats.totalStudents} 人（赠送标签 ${giftCount} 人）\n`+
+    `- **总购买课时**：${stats.totalHours} h\n`+
+    `- **未消课时总额**：${stats.remainHours} h\n`+
+    `- 🌟 **今日消课进度**：${stats.todayHours} h (${stats.todayCount} 单)\n`+
+    `- 📅 **本周消课进度**：${stats.weekHours} h (${stats.weekCount} 单)\n`+
+    `- 📆 **本月消课进度**：${stats.monthHours} h (${stats.monthCount} 单)\n`+
+    `- ⚠️ **课时不足预警**：${stats.warningCount} 个课包 (<=5h)\n`+
+    (include ? `- 📋 **已预约未排课**：${rows.length} 单 / ${hours} h，完整明细随后发送\n` : '')+
+    `- **同步时间**：${new Date().toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}\n\n*数据源自新东方专升本项目中心系统*`;
+  return [{msgtype:'markdown',markdown:{title,text}},...(include?buildDingTalkPendingSchedulingPayloads(rows):[])];
+}
+function dailyReportSetSendStatus(message, error=false) {
+  const el=document.getElementById('daily-report-send-status');if(el){el.textContent=message;el.style.color=error?'#b91c1c':'#0369a1';}
+}
+async function sendDingTalkReportPayloads(payloads, mode, progress) {
+  const total=payloads.length;
+  for(let index=progress?.sent||0;index<total;index++) {
+    dailyReportSetSendStatus(`正在发送 ${index+1}/${total} 页…`);
+    let result;
+    try {result=await sendDingTalkApi(payloads[index]);}catch(error){result={success:false,msg:error.message};}
+    if(!result?.success){const msg=`第 ${index+1}/${total} 页发送失败：${result?.msg||'未知错误'}。已发送 ${index} 页。`;dailyReportSetSendStatus(msg,true);if(mode==='manual')alert(msg);return {success:false,sent:index,total,msg};}
+    if(progress)progress.sent=index+1;
+  }
+  dailyReportSetSendStatus(`已成功发送 ${total} 页报表。`);
+  if(mode==='manual')alert(`已成功发送 ${total} 页报表至钉钉群。`);
+  return {success:true,sent:total,total};
+}
+sendDingTalkDailySummary = async function(mode='auto') {
+  if(!dingTalkConfig.webhook){if(mode==='manual')alert('请先填写并保存钉钉 Webhook。');return {success:false,msg:'未配置钉钉 Webhook'};}
+  if(dailyReportSending)return {success:false,msg:'报表正在发送，请稍候'};
+  dailyReportSending=true;
+  try {
+    let progress;
+    if(mode==='auto'){
+      const date=dailyReportNow().date;
+      if(!dailyReportAutoProgress||dailyReportAutoProgress.date!==date)dailyReportAutoProgress={date,payloads:buildDingTalkDailyReportPayloads(),sent:0};
+      progress=dailyReportAutoProgress;
+    }
+    const result=await sendDingTalkReportPayloads(progress?.payloads||buildDingTalkDailyReportPayloads(),mode,progress);
+    if(result.success&&mode==='auto'){
+      dingTalkConfig.lastSentDate=dailyReportNow().date;dailyReportAutoProgress=null;persist();
+    }
+    return result;
+  } finally {dailyReportSending=false;}
+};
+async function sendDingTalkPendingSchedulingReport() {
+  if(!dingTalkConfig.webhook){alert('请先填写并保存钉钉 Webhook。');switchTab('dingtalk');return {success:false};}
+  if(dailyReportSending){crmToast('报表正在发送，请稍候。');return {success:false};}
+  dailyReportSending=true;
+  try{return await sendDingTalkReportPayloads(buildDingTalkPendingSchedulingPayloads(),'manual');}finally{dailyReportSending=false;}
+}
+async function dailyReportTimerTick() {
+  if(!dingTalkConfig.dailyTimerEnable||!dingTalkConfig.webhook||dailyReportSending)return;
+  const now=dailyReportNow();
+  if(now.time<(dingTalkConfig.dailyTime||'18:00')||dingTalkConfig.lastSentDate===now.date)return;
+  if(dailyReportLastAutoAttempt&&Date.now()-dailyReportLastAutoAttempt<60000)return;
+  dailyReportLastAutoAttempt=Date.now();
+  return await sendDingTalkDailySummary('auto');
+}
+startDailyTimerWatcher = function() {setInterval(()=>{dailyReportTimerTick().catch(error=>dailyReportSetSendStatus('自动报表发送失败：'+error.message,true));},30000);};
+const reportOriginalLoadDingTalkConfig=loadDingTalkConfigToUI;
+loadDingTalkConfigToUI=function(){reportOriginalLoadDingTalkConfig();const el=document.getElementById('dingtalk-include-pending-scheduling');if(el)el.checked=dingTalkConfig.includePendingScheduling!==false;};
+toggleTimerSettings=function(){const enabled=document.getElementById('dingtalk-daily-timer-enable').checked;const time=document.getElementById('dingtalk-daily-time').value||'18:00';document.getElementById('timer-status-desc').textContent=enabled?`已开启：每天北京时间 ${time} 发送。需要此页面保持打开并联网，失败后会重试未发送的页。`:'未启用。每日自动发送需要页面保持打开并联网。';};
+function previewDingTalkDailyReport() {
+  const payloads=buildDingTalkDailyReportPayloads();
+  document.getElementById('daily-report-preview-content').textContent=payloads.map((p,i)=>`第 ${i+1}/${payloads.length} 页\n${p.markdown.text}`).join('\n\n────────────\n\n');
+  document.getElementById('daily-report-preview-dialog').showModal();
+}
+function renderDailyReportPreview() {
+  const tbody=document.getElementById('daily-report-unscheduled-body');if(!tbody)return;
+  const rows=dailyReportRows();document.getElementById('daily-report-unscheduled-count').textContent=`${rows.length} 单 · ${rows.reduce((n,r)=>n+Number(r.hours||0),0)} h`;
+  tbody.innerHTML=rows.length?rows.map(r=>`<tr><td>${crmEsc(r.studentName)}${r.isGift?' <span class="crm-badge" style="color:#7e22ce;background:#faf5ff">赠送</span>':''}</td><td>${crmEsc(r.course||'待补充')}</td><td>${crmEsc(r.teacher||'待分配')}</td><td>${Number(r.hours||0)} h</td><td style="white-space:pre-wrap;min-width:180px">${crmEsc(r.unscheduledReason||'尚未填写')}</td><td style="white-space:pre-wrap;min-width:180px">${crmEsc(r.nextAction||'待补充')}<small>${crmEsc(r.followupDate||'未设置跟进日期')}</small></td></tr>`).join(''):'<tr><td colspan="6" class="crm-empty">暂无已预约未排课记录。</td></tr>';
+}
+function installDailyReportUI() {
+  const settings=document.getElementById('timer-status-desc');
+  settings.insertAdjacentHTML('afterend',`<label class="flex items-start gap-2 text-xs text-blue-900 cursor-pointer pt-2"><input type="checkbox" id="dingtalk-include-pending-scheduling" class="rounded text-blue-600 w-4 h-4" checked><span>每日大盘日报同时发送【已预约未排课明细】附页（默认开启）</span></label>`);
+  document.querySelector('#tab-dingtalk>div.grid>div:last-child>div.space-y-2\\.5').insertAdjacentHTML('beforeend',`<button type="button" onclick="sendDingTalkPendingSchedulingReport()" class="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 font-medium py-2.5 px-4 rounded-lg text-sm text-left">单独推送【已预约未排课明细】</button><button type="button" onclick="previewDingTalkDailyReport()" class="w-full bg-white border border-slate-300 text-slate-700 py-2.5 px-4 rounded-lg text-sm text-left">预览完整日报（含附页）</button><p id="daily-report-send-status" class="text-xs leading-relaxed" role="status" aria-live="polite"></p>`);
+  document.getElementById('tab-dingtalk').insertAdjacentHTML('beforeend',`<div class="crm-panel"><div class="crm-panel-head"><div><h3>每日报表附页 · 已预约未排课</h3><p class="crm-subtitle">自动汇总未取消且尚未转排课的预约。管理页填写的原因和后续安排会一起发送。</p></div><div class="crm-inline"><span id="daily-report-unscheduled-count" class="crm-badge"></span><button class="crm-btn crm-btn-soft" type="button" onclick="switchTab('unscheduled')">去管理 / 填写原因</button></div></div><div class="crm-table-wrap"><table class="crm-table"><thead><tr><th>学生姓名 / 标签</th><th>课程</th><th>老师</th><th>课时</th><th>未排 / 未约原因</th><th>后续安排 / 跟进日期</th></tr></thead><tbody id="daily-report-unscheduled-body"></tbody></table></div></div>`);
+  document.body.insertAdjacentHTML('beforeend',`<dialog class="crm-dialog" id="daily-report-preview-dialog" aria-labelledby="daily-report-preview-title"><div class="crm-dialog-head"><div><h2 id="daily-report-preview-title" class="crm-dialog-title">钉钉日报预览</h2><p class="crm-dialog-subtitle">预览当前已保存的数据；此操作不会发送消息。</p></div><button type="button" class="crm-close" aria-label="关闭预览" onclick="document.getElementById('daily-report-preview-dialog').close()">×</button></div><pre id="daily-report-preview-content" style="white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.8 system-ui,sans-serif;padding:20px 26px;margin:0"></pre></dialog>`);
+}
+installDailyReportUI();
+const reportOriginalUpdateAllViews=updateAllViews;
+updateAllViews=function(){reportOriginalUpdateAllViews();renderDailyReportPreview();};
+renderDailyReportPreview();

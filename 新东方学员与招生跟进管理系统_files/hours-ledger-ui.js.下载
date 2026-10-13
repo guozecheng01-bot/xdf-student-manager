@@ -1,0 +1,231 @@
+/* 课时老账与新账维护。数据计算与迁移由 XdfHoursLedger 统一处理。 */
+(function () {
+  'use strict';
+  const dialogId = 'hours-ledger-dialog';
+  let activeStudentId = null;
+  let saving = false;
+  const labels = { taught: '已排已上', pending: '已排未上', unscheduled: '未排待排' };
+  const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const el = id => document.getElementById(id);
+  const findStudent = id => students.find(student => String(student.id) === String(id));
+  const fmt = value => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Number(number.toFixed(6)).toLocaleString('zh-CN', { maximumFractionDigits: 6 }) : '—';
+  };
+  const total = values => Number(values?.total ?? (Number(values?.taught || 0) + Number(values?.pending || 0) + Number(values?.unscheduled || 0)));
+  const today = () => {
+    const date = new Date();
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  };
+  const stamp = value => {
+    const raw = String(value || '');
+    if (!raw) return '';
+    const date = new Date(raw);
+    return Number.isNaN(date.getTime()) ? raw : date.toLocaleString('zh-CN', { hour12: false });
+  };
+  function setError(message) {
+    el('hours-ledger-error').textContent = message || '';
+    if (message) el('hours-ledger-error').scrollIntoView({ block: 'nearest' });
+  }
+  function quantity(id, title, positive) {
+    const input = el(id);
+    const raw = input.value.trim();
+    const number = Number(raw);
+    if (!raw || !Number.isFinite(number) || (positive ? number <= 0 : number < 0)) {
+      input.focus();
+      throw new Error(`${title}请填写${positive ? '大于 0' : '大于或等于 0'}的有效课时，可填写小数。`);
+    }
+    return number;
+  }
+  function validDate(value) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const date = new Date(`${value}T12:00:00`);
+    return !Number.isNaN(date.getTime()) && date.getFullYear() === Number(match[1]) && date.getMonth() + 1 === Number(match[2]) && date.getDate() === Number(match[3]);
+  }
+  function draft() {
+    return Object.fromEntries(['taught', 'pending', 'unscheduled', 'baseline-note', 'purchase-hours', 'purchase-date', 'purchase-note'].map(key => [key, el(`hours-ledger-${key}`).value]));
+  }
+  function restoreDraft(values) {
+    Object.entries(values).forEach(([key, value]) => { el(`hours-ledger-${key}`).value = value; });
+    updateBaselineTotal();
+  }
+  function updateBaselineTotal() {
+    const values = Object.keys(labels).map(key => el(`hours-ledger-${key}`).value.trim());
+    el('hours-ledger-baseline-total').textContent = values.every(value => value !== '' && Number.isFinite(Number(value)) && Number(value) >= 0) ? `${fmt(values.reduce((sum, value) => sum + Number(value), 0))} 课时` : '请填写有效课时';
+  }
+  function summaryRow(title, values, className, signed) {
+    const cell = number => {
+      const value = Number(number || 0);
+      return `${signed && value > 0 ? '+' : ''}${fmt(value)}`;
+    };
+    return `<tr class="${className}"><th scope="row">${title}</th>${Object.keys(labels).map(key => `<td>${cell(values[key])}</td>`).join('')}<td>${cell(total(values))}</td></tr>`;
+  }
+  function describeValues(value) {
+    return `${labels.taught} ${fmt(value?.taught || 0)} / ${labels.pending} ${fmt(value?.pending || 0)} / ${labels.unscheduled} ${fmt(value?.unscheduled || 0)}`;
+  }
+  function historyEntries(ledger) {
+    const entries = [];
+    (ledger.baselineHistory || []).forEach((entry, index) => entries.push({
+      at: entry.at || '', order: index,
+      html: `<article class="hours-history-entry"><div><strong>老账${entry.before ? '调整' : '建立'}</strong><span>${esc(stamp(entry.at))}</span></div>${entry.before ? `<p class="hours-history-before">调整前：${esc(describeValues(entry.before))}</p>` : ''}<p>调整后：${esc(describeValues(entry.after))}</p>${entry.note ? `<p class="hours-history-note">备注：${esc(entry.note)}</p>` : ''}</article>`
+    }));
+    (ledger.adjustments || []).forEach((entry, index) => {
+      const title = entry.type === 'purchase' ? '新购课时' : entry.type === 'manual-taught' ? '补记已上课时' : entry.type === 'claim' ? '历史数据衔接' : '课时调整';
+      const content = entry.type === 'purchase' ? `未排待排 +${fmt(entry.hours)} 课时` : `已排已上 ${fmt(entry.taught || 0)} / 已排未上 ${fmt(entry.pending || 0)} / 未排待排 ${fmt(entry.unscheduled || 0)}`;
+      entries.push({ at: entry.at || entry.date || '', order: index + (ledger.baselineHistory || []).length,
+        html: `<article class="hours-history-entry"><div><strong>${title}</strong><span>${esc(entry.date || stamp(entry.at))}</span></div><p>${esc(content)}</p>${entry.note ? `<p class="hours-history-note">备注：${esc(entry.note)}</p>` : ''}</article>` });
+    });
+    entries.sort((a, b) => String(b.at).localeCompare(String(a.at)) || b.order - a.order);
+    return entries;
+  }
+  function renderHistory(student) {
+    const current = historyEntries(student.hoursLedger);
+    const archives = (Array.isArray(student.hoursLedgerArchives) ? student.hoursLedgerArchives : []).map((archive, index) => ({ archive, index })).sort((a, b) => String(b.archive.archivedAt || '').localeCompare(String(a.archive.archivedAt || '')) || b.index - a.index);
+    let count = current.length;
+    const html = [`<div class="hours-history-period"><h4>当前账本</h4>${current.length ? current.map(entry => entry.html).join('') : '<p class="hours-ledger-empty">当前账本暂无手工调整记录。保存老账或新增购课后，会在这里保留记录。</p>'}</div>`];
+    archives.forEach(({ archive, index }) => {
+      const ledger = archive.ledger || {};
+      const entries = historyEntries(ledger);
+      count += entries.length;
+      html.push(`<div class="hours-history-period"><h4>第 ${index + 1} 次结转前账本</h4><article class="hours-history-entry hours-history-archive"><div><strong>账本结转存档</strong><span>${esc(stamp(archive.archivedAt))}</span></div><p>结转原因：${esc(archive.reason || '未填写')}</p><p>老账来源：${esc(ledger.source || '未记录')}${ledger.createdAt ? ` · 建立于 ${esc(stamp(ledger.createdAt))}` : ''}</p><p>结转前老账基数：${esc(describeValues(ledger.baseline))} / 总课时 ${fmt(total(ledger.baseline))}</p>${ledger.note ? `<p class="hours-history-note">原账本备注：${esc(ledger.note)}</p>` : ''}${ledger.reviewNote ? `<p class="hours-history-note">原核对提醒：${esc(ledger.reviewNote)}</p>` : ''}</article>${entries.length ? entries.map(entry => entry.html).join('') : '<p class="hours-ledger-empty">该存档账本没有手工调整记录。</p>'}</div>`);
+    });
+    el('hours-ledger-history-count').textContent = `${count} 条调整${archives.length ? ` · ${archives.length} 次结转存档` : ''}`;
+    el('hours-ledger-history').innerHTML = html.join('');
+  }
+  function render(resetInputs) {
+    const student = findStudent(activeStudentId);
+    if (!student) throw new Error('该学员已不存在，请关闭窗口后重新选择。');
+    const summary = XdfHoursLedger.summary(student, records, schedules);
+    el('hours-ledger-name').textContent = `${student.name || '未命名学员'} · 课时账本`;
+    el('hours-ledger-course').textContent = student.course || '学员课时';
+    el('hours-ledger-summary').innerHTML = summaryRow('老账 · 默认基数', summary.baseline, '', false) + summaryRow('新账 · 净变动', summary.delta, 'hours-ledger-delta', true) + summaryRow('当前合计', summary.current, 'hours-ledger-current', false);
+    el('hours-ledger-origin').textContent = `老账来源：${summary.ledger.source || '现有数据'}。${summary.ledger.createdAt ? `建立于 ${stamp(summary.ledger.createdAt)}。` : '首次建立老账后，后续排课、上课和新购课计入新账。'}`;
+    el('hours-ledger-review').textContent = summary.ledger.reviewNote || '';
+    el('hours-ledger-review').hidden = !summary.ledger.reviewNote;
+    if (resetInputs) {
+      Object.keys(labels).forEach(key => { el(`hours-ledger-${key}`).value = Number(summary.baseline[key] || 0); });
+      el('hours-ledger-baseline-note').value = '';
+      el('hours-ledger-purchase-hours').value = '';
+      el('hours-ledger-purchase-date').value = today();
+      el('hours-ledger-purchase-note').value = '';
+    }
+    updateBaselineTotal();
+    renderHistory(student);
+  }
+  function refreshDetail(student) {
+    const detail = document.getElementById('modal-student-detail');
+    if (detail && !detail.classList.contains('hidden') && typeof showStudentDetailModal === 'function') showStudentDetailModal(student.id);
+  }
+  async function save(kind) {
+    if (saving) return;
+    const student = findStudent(activeStudentId);
+    if (!student) { setError('该学员已不存在，请关闭窗口后重新选择。'); return; }
+    const inputs = draft();
+    let before;
+    let studentsBeforeJSON;
+    let persistStarted = false;
+    setError('');
+    try {
+      let values;
+      if (kind === 'baseline') values = Object.fromEntries(Object.keys(labels).map(key => [key, quantity(`hours-ledger-${key}`, labels[key], false)]));
+      const hours = kind === 'purchase' ? quantity('hours-ledger-purchase-hours', '新购课时', true) : null;
+      const date = el('hours-ledger-purchase-date').value;
+      if (kind === 'purchase' && !validDate(date)) { el('hours-ledger-purchase-date').focus(); throw new Error('请选择有效的购课日期。'); }
+      before = JSON.parse(JSON.stringify(student));
+      studentsBeforeJSON = JSON.stringify(students);
+      saving = true;
+      el('hours-ledger-save-baseline').disabled = true;
+      el('hours-ledger-save-purchase').disabled = true;
+      if (kind === 'baseline') XdfHoursLedger.setBaseline(student, values, records, schedules, el('hours-ledger-baseline-note').value.trim());
+      else XdfHoursLedger.purchase(student, hours, date, el('hours-ledger-purchase-note').value.trim());
+      XdfHoursLedger.sync(student, records, schedules);
+      persistStarted = true;
+      await Promise.resolve(persist());
+    } catch (error) {
+      let storageRecoveryFailed = false;
+      if (before) {
+        Object.keys(student).forEach(key => { delete student[key]; });
+        Object.assign(student, before);
+        const current = findStudent(student.id);
+        if (current && current !== student) { Object.keys(current).forEach(key => { delete current[key]; }); Object.assign(current, JSON.parse(JSON.stringify(before))); }
+        if (persistStarted && studentsBeforeJSON !== undefined) {
+          try { localStorage.setItem('xdf_students', studentsBeforeJSON); }
+          catch (_) { storageRecoveryFailed = true; }
+        }
+        try { if (typeof updateAllViews === 'function') updateAllViews(); refreshDetail(student); } catch (_) { /* 保留保存错误信息。 */ }
+      }
+      try { render(false); restoreDraft(inputs); } catch (_) { /* 学员移除时保留原窗口。 */ }
+      const message = error?.message || '保存失败，请重试。';
+      setError(message + (storageRecoveryFailed ? ' 浏览器存储仍不可用，旧账在当前页面已恢复；请立即下载数据备份，避免关闭页面后丢失。' : ''));
+      return;
+    } finally {
+      saving = false;
+      el('hours-ledger-save-baseline').disabled = false;
+      el('hours-ledger-save-purchase').disabled = false;
+    }
+    render(true);
+    refreshDetail(student);
+    crmToast(kind === 'baseline' ? '老账已保存，新账变动已保留。' : '新购课时已计入未排待排。');
+  }
+  function install() {
+    if (el(dialogId)) return;
+    const style = document.createElement('style');
+    style.textContent = `
+      #hours-ledger-dialog{width:min(800px,calc(100vw - 24px));max-height:92vh;overflow:auto}
+      #hours-ledger-dialog .hours-ledger-body{padding:20px 28px 26px}
+      #hours-ledger-dialog .hours-ledger-help{font-size:12px;line-height:1.8;color:#64748b;margin:0 0 14px}
+      #hours-ledger-dialog .hours-ledger-help strong{color:#334155}
+      #hours-ledger-dialog .hours-ledger-table-wrap{overflow-x:auto;border:1px solid #e2e8f0;border-radius:10px}
+      #hours-ledger-dialog .hours-ledger-table{border-collapse:collapse;width:100%;min-width:490px;font-size:12px}
+      #hours-ledger-dialog .hours-ledger-table th,#hours-ledger-dialog .hours-ledger-table td{padding:11px 10px;border-bottom:1px solid #e2e8f0;text-align:right;white-space:nowrap}
+      #hours-ledger-dialog .hours-ledger-table th:first-child{text-align:left}
+      #hours-ledger-dialog .hours-ledger-table thead{background:#f8fafc;color:#475569}
+      #hours-ledger-dialog .hours-ledger-table thead th:nth-child(2){color:#047857}
+      #hours-ledger-dialog .hours-ledger-table thead th:nth-child(3){color:#2563eb}
+      #hours-ledger-dialog .hours-ledger-table thead th:nth-child(4){color:#7c3aed}
+      #hours-ledger-dialog .hours-ledger-table tr:last-child>*{border-bottom:0}
+      #hours-ledger-dialog .hours-ledger-current{background:#eff6ff;font-weight:750;color:#1e40af}
+      #hours-ledger-dialog .hours-ledger-delta{color:#64748b}
+      #hours-ledger-dialog .hours-ledger-section{padding-top:19px;margin-top:19px;border-top:1px solid #e2e8f0}
+      #hours-ledger-dialog .hours-ledger-section h3{font-size:15px;font-weight:750;color:#0f172a;margin-bottom:6px}
+      #hours-ledger-dialog .hours-ledger-three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+      #hours-ledger-dialog .hours-ledger-purchase-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+      #hours-ledger-dialog .hours-ledger-note{margin-top:12px}
+      #hours-ledger-dialog .hours-ledger-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:13px}
+      #hours-ledger-dialog .hours-ledger-total,#hours-ledger-dialog .hours-ledger-origin{font-size:11px;line-height:1.7;color:#64748b}
+      #hours-ledger-dialog .hours-ledger-origin{margin-top:9px}
+      #hours-ledger-dialog .hours-ledger-review{font-size:12px;line-height:1.8;margin-top:10px;padding:10px 12px;border:1px solid #fcd34d;border-radius:8px;background:#fffbeb;color:#92400e;white-space:pre-wrap;overflow-wrap:anywhere}
+      #hours-ledger-dialog .hours-ledger-history{max-height:260px;overflow-y:auto;padding-right:4px;margin-top:12px}
+      #hours-ledger-dialog .hours-history-period{margin-bottom:17px}
+      #hours-ledger-dialog .hours-history-period h4{font-size:12px;font-weight:700;color:#475569;margin:4px 0 9px}
+      #hours-ledger-dialog .hours-history-archive{background:#f8fafc;border-left:3px solid #94a3b8}
+      #hours-ledger-dialog .hours-history-entry{border:1px solid #e2e8f0;border-radius:8px;padding:11px 13px;margin-bottom:9px;font-size:12px}
+      #hours-ledger-dialog .hours-history-entry>div{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;color:#334155}
+      #hours-ledger-dialog .hours-history-entry>div span{color:#94a3b8;font-size:11px}
+      #hours-ledger-dialog .hours-history-entry p{line-height:1.8;margin-top:5px;color:#475569;white-space:pre-wrap;overflow-wrap:anywhere}
+      #hours-ledger-dialog .hours-history-entry .hours-history-before,#hours-ledger-dialog .hours-history-entry .hours-history-note{color:#64748b}
+      #hours-ledger-dialog .hours-ledger-empty{font-size:12px;line-height:1.8;background:#f8fafc;border-radius:8px;padding:17px;color:#94a3b8}
+      #hours-ledger-dialog .hours-ledger-history-title{display:flex;justify-content:space-between;align-items:center;gap:10px}
+      #hours-ledger-dialog #hours-ledger-error{position:sticky;bottom:0;background:white;padding-top:6px;margin-top:10px}
+      #hours-ledger-dialog #hours-ledger-error:empty{display:none}
+      @media(max-width:560px){#hours-ledger-dialog .crm-dialog-head{padding:19px 18px 16px}#hours-ledger-dialog .hours-ledger-body{padding:17px 18px 22px}#hours-ledger-dialog .hours-ledger-three{gap:8px}#hours-ledger-dialog .crm-field label{font-size:11px}#hours-ledger-dialog .crm-field input{padding:9px 8px}#hours-ledger-dialog .hours-ledger-actions{align-items:flex-start}#hours-ledger-dialog .hours-ledger-actions .crm-btn{white-space:normal}}
+    `;
+    document.head.appendChild(style);
+    document.body.insertAdjacentHTML('beforeend', `<dialog id="${dialogId}" class="crm-dialog" aria-labelledby="hours-ledger-name"><div class="crm-dialog-head"><div><h2 class="crm-dialog-title" id="hours-ledger-name">课时账本</h2><p class="crm-dialog-subtitle" id="hours-ledger-course"></p></div><button type="button" class="crm-close" aria-label="关闭课时账本" id="hours-ledger-close">×</button></div><div class="hours-ledger-body"><p class="hours-ledger-help"><strong>老账</strong>是接管前的默认课时，可手工修正；<strong>新账</strong>记录接管后的购课、排课和上课变化。当前合计 = 老账 + 新账净变动。</p><div class="hours-ledger-table-wrap"><table class="hours-ledger-table"><thead><tr><th scope="col">课时口径</th><th scope="col">已排已上</th><th scope="col">已排未上</th><th scope="col">未排待排</th><th scope="col">总课时</th></tr></thead><tbody id="hours-ledger-summary"></tbody></table></div><p id="hours-ledger-origin" class="hours-ledger-origin"></p><p id="hours-ledger-review" class="hours-ledger-review" role="status" hidden></p><section class="hours-ledger-section"><h3>维护老账 · 默认基数</h3><p class="hours-ledger-help">输入接管前已经上完、已经排好但未上，以及尚待排课的课时。修改只替换老账，新账变动继续保留。</p><form id="hours-ledger-baseline-form" novalidate><div class="hours-ledger-three">${Object.entries(labels).map(([key, label]) => `<div class="crm-field"><label for="hours-ledger-${key}">${label}（课时）</label><input id="hours-ledger-${key}" type="number" min="0" step="any" inputmode="decimal" required></div>`).join('')}</div><div class="crm-field hours-ledger-note"><label for="hours-ledger-baseline-note">调整备注（选填）</label><input id="hours-ledger-baseline-note" maxlength="1000" placeholder="例如：按家长确认的历史账目修正"></div><div class="hours-ledger-actions"><span class="hours-ledger-total">老账总课时：<strong id="hours-ledger-baseline-total"></strong></span><button id="hours-ledger-save-baseline" class="crm-btn crm-btn-primary" type="submit">保存老账基数</button></div></form></section><section class="hours-ledger-section"><h3>新增购课 · 记入新账</h3><p class="hours-ledger-help">新购课时先增加到“未排待排”。之后在排课和上课时，三个状态会随记录联动更新。</p><form id="hours-ledger-purchase-form" novalidate><div class="hours-ledger-purchase-grid"><div class="crm-field"><label for="hours-ledger-purchase-hours">新购课时</label><input id="hours-ledger-purchase-hours" type="number" min="0" step="any" inputmode="decimal" placeholder="如：20 或 1.5" required></div><div class="crm-field"><label for="hours-ledger-purchase-date">购课日期</label><input id="hours-ledger-purchase-date" type="date" required></div></div><div class="crm-field hours-ledger-note"><label for="hours-ledger-purchase-note">购课备注（选填）</label><input id="hours-ledger-purchase-note" maxlength="1000" placeholder="例如：续费 20 课时"></div><div class="hours-ledger-actions"><span class="hours-ledger-total">每次新增都会保留记录</span><button id="hours-ledger-save-purchase" class="crm-btn crm-btn-soft" type="submit">＋ 计入新购课时</button></div></form></section><section class="hours-ledger-section"><div class="hours-ledger-history-title"><h3>历史调整记录</h3><span class="crm-muted" id="hours-ledger-history-count"></span></div><p class="hours-ledger-help">保留当前账本及每次结转前账本的老账调整、购课记录。结转前的排课和上课原始明细仍在原学员排课档案中查看。</p><div id="hours-ledger-history" class="hours-ledger-history"></div></section><p id="hours-ledger-error" class="crm-error" role="alert" aria-live="polite"></p></div></dialog>`);
+    el('hours-ledger-close').addEventListener('click', () => el(dialogId).close());
+    el('hours-ledger-baseline-form').addEventListener('submit', event => { event.preventDefault(); save('baseline'); });
+    el('hours-ledger-purchase-form').addEventListener('submit', event => { event.preventDefault(); save('purchase'); });
+    Object.keys(labels).forEach(key => el(`hours-ledger-${key}`).addEventListener('input', updateBaselineTotal));
+    el(dialogId).addEventListener('close', () => { if (!saving) activeStudentId = null; });
+  }
+  window.openHoursLedger = function (studentId) {
+    install();
+    if (saving) { crmToast('正在保存课时，请稍候。'); return; }
+    activeStudentId = studentId;
+    try { render(true); setError(''); crmOpenDialog(dialogId); }
+    catch (error) { crmToast(error?.message || '无法打开课时账本。', true); }
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, { once: true });
+  else install();
+})();

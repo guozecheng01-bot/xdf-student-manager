@@ -1,0 +1,310 @@
+(function (root, factory) {
+  'use strict';
+  var api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  if (root) root.XdfErpCore = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  var EPSILON = 1e-6;
+  var KIND = 'xdf-erp-report';
+  var HOURS = ['totalHours', 'scheduledHours', 'unscheduledHours', 'consumedHours', 'remainingHours'];
+  var FIELDS = {
+    name: ['学生姓名', '学员姓名'],
+    productName: ['产品名称'],
+    intendedSubjects: ['意向科目'],
+    departmentName: ['集团产品分类'],
+    totalFee: ['总课时费'],
+    totalHours: ['课时数', '总课时', '总课时数'],
+    scheduledHours: ['已派', '已排', '已排课时'],
+    unscheduledHours: ['未排', '未排课时'],
+    consumedHours: ['已派已上', '已消课时', '已消耗课时'],
+    remainingHours: ['剩余课时数', '剩余课时'],
+    remainingFee: ['剩余课时费'],
+    studentId: ['学生ID', '学生编号', '学员ID', '学员编号', 'ERP学生ID'],
+    packageId: ['课时包ID', '课时包编号', '包ID', '包编号']
+  };
+  var REQUIRED = ['name'].concat(HOURS);
+
+  function fail(code, message, details) {
+    var error = new Error(message);
+    error.code = code;
+    error.details = details || {};
+    throw error;
+  }
+  function text(value) { return value === null || value === undefined ? '' : String(value).trim(); }
+  function header(value) { return text(value).replace(/^\uFEFF/, '').replace(/\s+/g, '').toUpperCase(); }
+  function clone(value) {
+    if (value === null || typeof value !== 'object') return value;
+    if (value instanceof Date) return value.toISOString();
+    if (Array.isArray(value)) return value.map(clone);
+    var out = {};
+    Object.keys(value).forEach(function (key) {
+      Object.defineProperty(out, key, { value: clone(value[key]), enumerable: true, writable: true, configurable: true });
+    });
+    return out;
+  }
+  function numeric(value) {
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value !== 'string' || !value.trim()) return null;
+    var normalized = value.trim();
+    if (normalized.indexOf(',') !== -1) {
+      if (!/^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?(?:[eE][+-]?\d+)?$/.test(normalized)) return null;
+      normalized = normalized.replace(/,/g, '');
+    }
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(normalized)) return null;
+    var parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  function round(value) { return Number(value.toFixed(10)); }
+  function sameHours(left, right) { return Math.abs(left - right) <= EPSILON; }
+  function distinct(values) { return Array.from(new Set(values.filter(function (v) { return v !== ''; }))); }
+  function warning(code, message, extra) { return Object.assign({ code: code, message: message }, extra || {}); }
+  function blankRow(row) {
+    return row === null || row === undefined || (Array.isArray(row) && row.every(function (v) { return v === null || v === undefined || (typeof v === 'string' && !v.trim()); }));
+  }
+  function mapHeaders(row) {
+    var found = {}, duplicate = [];
+    Object.keys(FIELDS).forEach(function (key) {
+      var aliases = FIELDS[key].map(header);
+      row.forEach(function (cell, col) {
+        if (aliases.indexOf(header(cell)) === -1) return;
+        if (found[key] !== undefined) duplicate.push(key);
+        else found[key] = col;
+      });
+    });
+    return { fields: found, duplicate: duplicate };
+  }
+  function emptyTotals() {
+    return { totalHours: 0, consumedHours: 0, remainingHours: 0, scheduledHours: 0, unscheduledHours: 0,
+      pendingScheduledHours: 0, totalFee: null, remainingFee: null, totalFeeComplete: true, remainingFeeComplete: true,
+      studentCount: 0, packageCount: 0 };
+  }
+  function sumPackages(packages) {
+    var totals = emptyTotals(), totalFeeCount = 0, remainingFeeCount = 0, totalFee = 0, remainingFee = 0;
+    packages.forEach(function (item) {
+      HOURS.forEach(function (key) { totals[key] += item[key]; });
+      if (item.totalFee !== null) { totalFee += item.totalFee; totalFeeCount++; }
+      if (item.remainingFee !== null) { remainingFee += item.remainingFee; remainingFeeCount++; }
+    });
+    HOURS.forEach(function (key) {
+      if (!Number.isFinite(totals[key])) fail('TOTAL_OVERFLOW', '课时汇总超出可处理的数字范围。', { field: key });
+      totals[key] = round(totals[key]);
+    });
+    totals.pendingScheduledHours = round(totals.scheduledHours - totals.consumedHours);
+    if (!Number.isFinite(totalFee) || !Number.isFinite(remainingFee)) fail('TOTAL_OVERFLOW', '金额汇总超出可处理的数字范围。');
+    totals.totalFee = totalFeeCount ? round(totalFee) : null;
+    totals.remainingFee = remainingFeeCount ? round(remainingFee) : null;
+    totals.totalFeeComplete = totalFeeCount === packages.length;
+    totals.remainingFeeComplete = remainingFeeCount === packages.length;
+    totals.packageCount = packages.length;
+    return totals;
+  }
+
+  function parseMatrix(matrix, options) {
+    options = options || {};
+    if (!Array.isArray(matrix)) fail('INVALID_MATRIX', '需要 Excel 工作表的二维单元格数组。');
+    var headerIndex = -1, fieldMap, best;
+    for (var i = 0; i < Math.min(matrix.length, 20); i++) {
+      if (!Array.isArray(matrix[i])) continue;
+      var candidate = mapHeaders(matrix[i]);
+      var missing = REQUIRED.filter(function (key) { return candidate.fields[key] === undefined; });
+      if (candidate.fields.name !== undefined && (!best || missing.length < best.missing.length)) {
+        best = { index: i, missing: missing };
+      }
+      if (!missing.length) {
+        if (candidate.duplicate.length) fail('DUPLICATE_COLUMNS', '表头中存在重复的课时包字段。', { headerRow: i + 1, fields: candidate.duplicate });
+        headerIndex = i; fieldMap = candidate.fields; break;
+      }
+    }
+    if (headerIndex < 0) {
+      if (best) fail('MISSING_COLUMNS', '学生明细缺少必要的课时字段。', {
+        headerRow: best.index + 1, columns: best.missing.map(function (key) { return FIELDS[key][0]; })
+      });
+      fail('HEADER_NOT_FOUND', '前 20 行没有找到学生明细表头，请选择包含学生姓名及完整课时字段的工作表。');
+    }
+    var warnings = [], rows = [], groupMap = new Map(), idToName = new Map(), packageIdToRow = new Map(), rawFingerprints = new Map();
+    var headerValues = matrix[headerIndex];
+    if (fieldMap.studentId === undefined || fieldMap.packageId === undefined) {
+      warnings.push(warning('MISSING_SOURCE_IDS', '报表未提供完整的学生和课时包唯一编号；按姓名汇总，不能可靠区分同名学生或同规格续费。', {
+        studentIdAvailable: fieldMap.studentId !== undefined, packageIdAvailable: fieldMap.packageId !== undefined
+      }));
+    }
+    if (fieldMap.productName === undefined) warnings.push(warning('MISSING_PRODUCT_COLUMN', '报表没有产品名称列，新学生的课程名称将留空。'));
+    for (var rowIndex = headerIndex + 1; rowIndex < matrix.length; rowIndex++) {
+      var cells = matrix[rowIndex];
+      if (blankRow(cells)) continue;
+      if (!Array.isArray(cells)) fail('INVALID_ROW', '学生明细包含非单元格数组的记录。', { sourceRow: rowIndex + 1 });
+      var get = function (key) { return fieldMap[key] === undefined ? undefined : cells[fieldMap[key]]; };
+      var name = text(get('name'));
+      if (!name) fail('MISSING_STUDENT_NAME', '学生明细存在未填写学生姓名的非空记录。', { sourceRow: rowIndex + 1 });
+      var pkg = { sourceRow: rowIndex + 1, studentName: name, studentId: text(get('studentId')) || null,
+        packageId: text(get('packageId')) || null, productName: text(get('productName')),
+        intendedSubjects: text(get('intendedSubjects')), departmentName: text(get('departmentName')) };
+      if (pkg.packageId) {
+        if (packageIdToRow.has(pkg.packageId)) {
+          fail('DUPLICATE_PACKAGE_ID', '课时包编号重复，无法安全计入课时和金额汇总。', {
+            sourceRow: pkg.sourceRow, firstSourceRow: packageIdToRow.get(pkg.packageId)
+          });
+        }
+        packageIdToRow.set(pkg.packageId, pkg.sourceRow);
+      }
+      HOURS.forEach(function (key) {
+        var value = numeric(get(key));
+        if (value === null) fail('INVALID_HOURS', '课时字段为空或不是有效数字。', { sourceRow: rowIndex + 1, field: key, column: FIELDS[key][0] });
+        if (value < 0) fail('NEGATIVE_HOURS', '课时字段不能为负数。', { sourceRow: rowIndex + 1, field: key, column: FIELDS[key][0] });
+        pkg[key] = value;
+      });
+      if (!sameHours(pkg.totalHours, pkg.scheduledHours + pkg.unscheduledHours)) {
+        fail('HOURS_INCONSISTENT', '总课时应等于已派课时加未排课时。', { sourceRow: pkg.sourceRow, equation: 'total=scheduled+unscheduled' });
+      }
+      if (!sameHours(pkg.totalHours, pkg.consumedHours + pkg.remainingHours)) {
+        fail('HOURS_INCONSISTENT', '总课时应等于已派已上课时加剩余课时。', { sourceRow: pkg.sourceRow, equation: 'total=consumed+remaining' });
+      }
+      if (pkg.consumedHours > pkg.scheduledHours + EPSILON) {
+        fail('HOURS_INCONSISTENT', '已派已上课时不能大于已派课时。', { sourceRow: pkg.sourceRow, equation: 'consumed<=scheduled' });
+      }
+      ['totalFee', 'remainingFee'].forEach(function (key) {
+        var value = get(key);
+        pkg[key] = numeric(value);
+        if (fieldMap[key] !== undefined && text(value) && pkg[key] === null) {
+          warnings.push(warning('INVALID_OPTIONAL_MONEY', '金额字段无法解析，原值已保留且不参与金额汇总。', { sourceRow: pkg.sourceRow, field: key }));
+        }
+      });
+      var raw = {};
+      headerValues.forEach(function (label, col) {
+        var rawKey = text(label) || ('column_' + (col + 1));
+        if (Object.prototype.hasOwnProperty.call(raw, rawKey)) rawKey += '__column_' + (col + 1);
+        Object.defineProperty(raw, rawKey, { value: clone(cells[col] === undefined ? null : cells[col]), enumerable: true, writable: true, configurable: true });
+      });
+      pkg.raw = raw;
+      var fingerprint = JSON.stringify(raw);
+      if (rawFingerprints.has(fingerprint)) {
+        warnings.push(warning('DUPLICATE_RAW_ROW_PRESERVED', '发现内容相同的明细行，已分别保留并计入汇总，请核对是否为不同课时包。', {
+          sourceRow: pkg.sourceRow, firstSourceRow: rawFingerprints.get(fingerprint)
+        }));
+      } else rawFingerprints.set(fingerprint, pkg.sourceRow);
+      if (pkg.studentId) {
+        if (idToName.has(pkg.studentId) && idToName.get(pkg.studentId) !== name) {
+          fail('ERP_ID_CONFLICT', '同一个 ERP 学生编号对应不同姓名，无法安全合并。', { sourceRow: pkg.sourceRow });
+        }
+        idToName.set(pkg.studentId, name);
+      }
+      if (!groupMap.has(name)) groupMap.set(name, { name: name, studentId: pkg.studentId, packages: [] });
+      var group = groupMap.get(name);
+      if (group.studentId && pkg.studentId && group.studentId !== pkg.studentId) {
+        fail('ERP_ID_CONFLICT', '同名明细存在不同 ERP 学生编号，无法按姓名汇总。', { sourceRow: pkg.sourceRow });
+      }
+      if (!group.studentId && pkg.studentId) group.studentId = pkg.studentId;
+      group.packages.push(pkg); rows.push(pkg);
+    }
+    if (!rows.length) fail('EMPTY_SNAPSHOT', '学生明细没有可同步的记录。');
+    if ((fieldMap.studentId !== undefined && rows.some(function (r) { return !r.studentId; })) ||
+        (fieldMap.packageId !== undefined && rows.some(function (r) { return !r.packageId; }))) {
+      warnings.push(warning('PARTIAL_SOURCE_IDS', '部分记录的学生或课时包编号为空，不能完整验证来源身份。'));
+    }
+    var groups = Array.from(groupMap.values()).map(function (group) {
+      var totals = sumPackages(group.packages);
+      return Object.assign({}, group, totals, { studentCount: 1,
+        products: distinct(group.packages.map(function (p) { return p.productName; })),
+        intendedSubjects: distinct(group.packages.map(function (p) { return p.intendedSubjects; })),
+        sourceRows: group.packages.map(function (p) { return p.sourceRow; }) });
+    });
+    var totals = sumPackages(rows); totals.studentCount = groups.length;
+    if (!totals.totalFeeComplete || !totals.remainingFeeComplete) {
+      warnings.push(warning('INCOMPLETE_MONEY', '部分金额缺失，金额合计仅包含报表中可解析的原始值。'));
+    }
+    warnings.push(warning('SOURCE_SEMANTICS', '已派包含已上与未上课时；未排不是全部剩余课时。意向科目不代表授课老师。'));
+    return { kind: KIND, version: 1, source: { kind: KIND, sourceKey: text(options.sourceKey) || 'erp-excel',
+      fileName: text(options.fileName), sheetName: text(options.sheetName) || '学生明细',
+      modifiedAt: options.modifiedAt === undefined ? null : clone(options.modifiedAt), headerRow: headerIndex + 1 },
+      rows: rows, groups: groups, totals: totals, warnings: warnings };
+  }
+
+  function boundId(student) {
+    student = student || {};
+    return text(student.erpSource && student.erpSource.studentId) || text(student.erpStudentId) || '';
+  }
+  function planMerge(snapshot, students, options) {
+    options = options || {};
+    if (!snapshot || snapshot.kind !== KIND || !Array.isArray(snapshot.groups) || !snapshot.source) {
+      fail('INVALID_SNAPSHOT', '需要先解析完整的 ERP 报表快照。');
+    }
+    if (!Array.isArray(students)) fail('INVALID_STUDENTS', '现有学生名单必须是数组。');
+    var nameMap = new Map(), erpIdMap = new Map(), usedIds = new Set(), maxId = 0;
+    students.forEach(function (student, index) {
+      var name = text(student && student.name);
+      if (!name) fail('INVALID_EXISTING_STUDENT', '现有学生名单中存在空姓名。', { index: index });
+      if (nameMap.has(name)) fail('DUPLICATE_EXISTING_NAME', '现有学生名单存在重复姓名，请先处理重名记录。', { indices: [nameMap.get(name), index] });
+      if (!Number.isSafeInteger(student.id) || student.id < 0) fail('INVALID_EXISTING_ID', '现有学生 ID 必须是非负安全整数。', { index: index });
+      if (usedIds.has(student.id)) fail('DUPLICATE_EXISTING_ID', '现有学生名单存在重复 ID。', { index: index });
+      nameMap.set(name, index); usedIds.add(student.id); maxId = Math.max(maxId, student.id);
+      var sourceId = boundId(student);
+      if (sourceId) {
+        if (erpIdMap.has(sourceId)) fail('ERP_ID_CONFLICT', '现有学生名单重复绑定同一个 ERP 学生编号。', { index: index });
+        erpIdMap.set(sourceId, index);
+      }
+    });
+    var result = students.map(clone), changes = [], warnings = clone(snapshot.warnings || []), represented = new Set(), incomingNames = new Set();
+    var summary = { newStudents: 0, updatedStudents: 0, unchangedStudents: 0, matchedByName: 0,
+      matchedById: 0, matchedByPreviousSource: 0, preservedStudents: 0, importedStudents: snapshot.groups.length,
+      packageCount: snapshot.rows.length, totals: clone(snapshot.totals) };
+    snapshot.groups.forEach(function (group) {
+      var name = text(group.name), incomingId = text(group.studentId), index, matchKind;
+      if (incomingNames.has(name)) fail('DUPLICATE_SNAPSHOT_STUDENT', '快照包含重复的学生汇总记录。');
+      incomingNames.add(name);
+      if (incomingId && erpIdMap.has(incomingId)) {
+        index = erpIdMap.get(incomingId); matchKind = 'erp-id';
+        if (text(students[index].name) !== name) fail('ERP_NAME_MISMATCH', 'ERP 编号与现有学生姓名不一致，请先核对对应关系。');
+      } else if (nameMap.has(name)) {
+        index = nameMap.get(name);
+        var existing = students[index], existingId = boundId(existing);
+        if (incomingId && existingId && incomingId !== existingId) fail('ERP_ID_MISMATCH', '同名学生的 ERP 编号不一致，已停止合并。');
+        var source = existing.erpSource || {};
+        var knownSource = source.kind === KIND && source.sourceKey === snapshot.source.sourceKey && source.studentName === name;
+        if (knownSource) matchKind = 'previous-source';
+        else if (options.allowNameMatch === true) matchKind = 'name';
+        else fail('NAME_MATCH_REQUIRED', '存在同名学生，需要明确允许按姓名匹配后才能合并。');
+      } else matchKind = 'new';
+      if (index !== undefined && represented.has(index)) fail('DUPLICATE_SNAPSHOT_STUDENT', '快照包含重复的学生汇总记录。');
+      var previous = index === undefined ? null : students[index];
+      var next;
+      if (previous) {
+        next = clone(previous); represented.add(index);
+      } else {
+        do { maxId++; } while (usedIds.has(maxId));
+        if (!Number.isSafeInteger(maxId)) fail('ID_SPACE_EXHAUSTED', '无法分配新的安全整数学生 ID。');
+        usedIds.add(maxId);
+        next = { id: maxId, name: name, teacher: '待分配', course: group.products.join('、'), phone: '' };
+      }
+      ['totalHours', 'consumedHours', 'scheduledHours', 'unscheduledHours'].forEach(function (key) { next[key] = group[key]; });
+      next.erpPackages = clone(group.packages);
+      next.erpSource = Object.assign({}, clone(snapshot.source), { syncedAt: options.syncedAt === undefined ? null : clone(options.syncedAt),
+        studentName: name, studentId: incomingId || (previous && boundId(previous)) || null,
+        sourceRows: clone(group.sourceRows), packageCount: group.packages.length, remainingHours: group.remainingHours,
+        pendingScheduledHours: group.pendingScheduledHours, totalFee: group.totalFee, remainingFee: group.remainingFee,
+        totalFeeComplete: group.totalFeeComplete, remainingFeeComplete: group.remainingFeeComplete });
+      var changedFields = ['totalHours', 'consumedHours', 'scheduledHours', 'unscheduledHours', 'erpPackages', 'erpSource']
+        .filter(function (key) { return !previous || JSON.stringify(previous[key]) !== JSON.stringify(next[key]); });
+      if (previous) {
+        result[index] = next;
+        if (changedFields.length) summary.updatedStudents++; else summary.unchangedStudents++;
+        if (matchKind === 'name') summary.matchedByName++;
+        if (matchKind === 'erp-id') summary.matchedById++;
+        if (matchKind === 'previous-source') summary.matchedByPreviousSource++;
+      } else {
+        result.push(next); nameMap.set(name, result.length - 1); summary.newStudents++;
+      }
+      changes.push({ studentId: next.id, name: name, action: previous ? (changedFields.length ? 'update' : 'unchanged') : 'create',
+        matchKind: matchKind, changedFields: changedFields, packageCount: group.packages.length,
+        before: previous ? { totalHours: previous.totalHours, consumedHours: previous.consumedHours,
+          scheduledHours: previous.scheduledHours, unscheduledHours: previous.unscheduledHours } : null,
+        after: { totalHours: next.totalHours, consumedHours: next.consumedHours,
+          scheduledHours: next.scheduledHours, unscheduledHours: next.unscheduledHours } });
+    });
+    summary.preservedStudents = students.length - represented.size;
+    if (summary.matchedByName) warnings.push(warning('NAME_MATCH_USED', '部分学生按姓名匹配；缺少唯一编号时仍需核对同名情况。', { count: summary.matchedByName }));
+    return { students: result, summary: summary, changes: changes, warnings: warnings };
+  }
+
+  return { parseMatrix: parseMatrix, planMerge: planMerge, EPSILON: EPSILON, KIND: KIND };
+});

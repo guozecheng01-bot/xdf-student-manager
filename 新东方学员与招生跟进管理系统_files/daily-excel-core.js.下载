@@ -1,0 +1,117 @@
+/* File parsing and atomic daily lesson plans; no network or browser storage. */
+(function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;root.XdfDailyExcel=api;})(globalThis,function(){
+  'use strict';
+  const text=v=>String(v??'').trim(), clone=v=>structuredClone(v), round=v=>Math.round((Number(v)+Number.EPSILON)*10000)/10000;
+  const headers=['学员姓名','课程类型','主讲老师','日期','课时','状态','课时来源','上课时间'];
+  const timeKey=v=>text(v).replace(/[\s–—]/g,c=>c.trim()?' ': '').replace(/ /g,'-');
+  function get(row,names){for(const k of names)if(row[k]!==undefined&&row[k]!==null&&text(row[k])!=='')return row[k];return undefined;}
+  function number(v,label){if(v===undefined||text(v)===''||!Number.isFinite(Number(v))||Number(v)<0||Number(v)>1e9)throw new Error(label+'必须是有效的非负数字。');return round(v);}
+  function date(v,fallback=''){
+    if(v===undefined||v===null||text(v)==='')v=fallback;
+    if(v instanceof Date){if(!Number.isFinite(v.getTime()))throw new Error('日期无效。');v=`${v.getFullYear()}-${String(v.getMonth()+1).padStart(2,'0')}-${String(v.getDate()).padStart(2,'0')}`;}
+    if(typeof v==='number'){if(v<1||v>150000)throw new Error('Excel 日期无效。');v=new Date(Math.floor(v-25569)*86400000).toISOString().slice(0,10);}
+    const m=text(v).match(/^(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日)?$/);if(!m)throw new Error('日期请填写 YYYY-MM-DD。');
+    const y=Number(m[1]),mo=Number(m[2]),d=Number(m[3]),dt=new Date(Date.UTC(y,mo-1,d));
+    if(y<2000||y>2200||dt.getUTCFullYear()!==y||dt.getUTCMonth()!==mo-1||dt.getUTCDate()!==d)throw new Error('日期不存在。');
+    return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  function parseRoster(input,{repairCompleted=false}={}){
+    const groups=new Map(),ids=new Map(),packs=new Set(),warnings=[];let count=0;
+    for(let i=0;i<input.length;i++){
+      const r=input[i];if(!Object.values(r).some(v=>text(v)))continue;
+      const name=text(get(r,['学员姓名','学生姓名','姓名','studentName']));if(!name)throw new Error(`第 ${i+2} 行缺少学员姓名。`);
+      const total=number(get(r,['总购买课时','总课时','课时数','lessonNum']),name+'的总购买课时');
+      const taught=number(get(r,['已排已上','已消课时','已派已上','haveLessonNum']),name+'的已排已上');
+      if(taught>total)throw new Error(name+'的已上课时超过总购买课时。');
+      const remainingValue=get(r,['未消剩余','剩余课时','剩余未消课时','remainLessonNum']);
+      if(remainingValue!==undefined&&Math.abs(total-taught-number(remainingValue,name+'的剩余课时'))>0.0001)throw new Error(name+'的已上加剩余不等于总购买课时。');
+      let pending,unscheduled;
+      const p=get(r,['已排未上']),sch=get(r,['已排','已派','已排课时','scheduleLessonNum']),u=get(r,['未排待排','未排课时','未排','unScheduleLessonNum']);
+      if(p!==undefined){pending=number(p,name+'的已排未上');unscheduled=u===undefined?round(total-taught-pending):number(u,name+'的未排待排');}
+      else if(sch!==undefined){const scheduled=number(sch,name+'的已排课时');pending=round(scheduled-taught);unscheduled=u===undefined?round(total-scheduled):number(u,name+'的未排待排');}
+      else if(u!==undefined){unscheduled=number(u,name+'的未排待排');pending=round(total-taught-unscheduled);}
+      else {pending=0;unscheduled=round(total-taught);}
+      if(pending<0&&repairCompleted&&Math.abs(total-taught)<0.0001){warnings.push(`${name}（第 ${i+2} 行）：已上和剩余优先，已排未上、未排待排修正为 0。`);pending=0;unscheduled=0;}
+      if(pending<0||unscheduled<0||Math.abs(total-taught-pending-unscheduled)>0.0001)throw new Error(`${name}（第 ${i+2} 行）的三类课时不平衡，请核对已排和已上；已上等于总课时的冲突可选择“已上和剩余优先”。`);
+      const sid=text(get(r,['studentCode','学员编号'])),pid=text(get(r,['packageCode','课时包编号']));
+      if(sid&&ids.has(name)&&ids.get(name)!==sid)throw new Error(name+'存在不同学员编号，请先区分同名学员。');if(sid)ids.set(name,sid);
+      if(pid&&packs.has(pid))throw new Error('文件中存在重复课时包，请先去重。');if(pid)packs.add(pid);
+      const course=text(get(r,['课程类型','productName','产品名称','集团产品分类']))||'待确认课程';
+      const teacher=text(get(r,['主讲老师','负责老师','任课老师']));
+      if(!groups.has(name))groups.set(name,{name,courses:new Set(),teachers:new Set(),totalHours:0,consumedHours:0,scheduledHours:0,unscheduledHours:0,sourceCount:0});
+      const g=groups.get(name);g.courses.add(course);if(teacher&&teacher!=='待分配')g.teachers.add(teacher);
+      g.totalHours=round(g.totalHours+total);g.consumedHours=round(g.consumedHours+taught);g.scheduledHours=round(g.scheduledHours+taught+pending);g.unscheduledHours=round(g.unscheduledHours+unscheduled);g.sourceCount++;count++;
+    }
+    if(!count)throw new Error('未找到学员课时数据。');
+    return {groups:[...groups.values()].map(g=>({name:g.name,course:[...g.courses].join('、'),teacher:[...g.teachers].join('、'),totalHours:g.totalHours,consumedHours:g.consumedHours,scheduledHours:g.scheduledHours,unscheduledHours:g.unscheduledHours,sourceCount:g.sourceCount})),count,warnings};
+  }
+  function rosterPlan(parsed,state,ledger){
+    const next=clone(state),names=new Map(next.students.map(s=>[text(s.name),s]));let id=Math.max(Date.now(),...next.students.map(s=>Number(s.id)||0)),added=0,updated=0;
+    for(const g of parsed.groups){let s=names.get(g.name);if(s)updated++;else{s={id:++id,name:g.name};next.students.push(s);names.set(g.name,s);added++;}
+      Object.assign(s,{course:g.course,teacher:g.teacher||s.teacher||'待分配',totalHours:g.totalHours,consumedHours:g.consumedHours,scheduledHours:g.scheduledHours,unscheduledHours:g.unscheduledHours});
+      ledger.establish(s,next.records,next.schedules,'课时包 Excel','仅导入姓名、课程、主讲老师与课时余额；原新账归档。');
+    }
+    return {state:next,added,updated,parsed};
+  }
+  function parseDaily(input,fallback){
+    const rows=[];date(fallback);
+    for(let i=0;i<input.length;i++){
+      const r=input[i];if(!Object.values(r).some(v=>text(v)))continue;
+      // Template rows with prefilled dates/status but no lesson are unused.
+      if(!text(get(r,['学员姓名','学生姓名','姓名']))&&!text(get(r,['课时','本次课时'])))continue;
+      const name=text(get(r,['学员姓名','学生姓名','姓名'])),teacher=text(get(r,['主讲老师','老师','任课老师']));
+      if(!name||!teacher)throw new Error(`第 ${i+2} 行请填写学员姓名和主讲老师。`);
+      const hours=number(get(r,['课时','本次课时']),`第 ${i+2} 行的课时`);if(hours<=0)throw new Error(`第 ${i+2} 行的课时必须大于 0。`);
+      const status=text(get(r,['状态']))||'已上课',source=text(get(r,['课时来源']))||'未排待排';
+      if(!['已上课','已排已上','已排未上'].includes(status))throw new Error(`第 ${i+2} 行的状态请填“已上课”或“已排未上”。`);
+      if(!['未排待排','老账已排未上'].includes(source))throw new Error(`第 ${i+2} 行的课时来源请填“未排待排”或“老账已排未上”。`);
+      const time=timeKey(get(r,['上课时间','时间段']));if(time&&!/^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/.test(time))throw new Error(`第 ${i+2} 行时间格式应为 09:00-11:00。`);
+      if(time&&time.slice(0,5)>=time.slice(6))throw new Error(`第 ${i+2} 行结束时间必须晚于开始时间。`);
+      rows.push({name,teacher,hours,status:status==='已排未上'?'pending':'taught',source,date:date(get(r,['日期','上课日期']),fallback),course:text(get(r,['课程类型','课程'])),timeRange:time,row:i+2});
+    }
+    if(!rows.length)throw new Error('没有填写任何上课记录。');return rows;
+  }
+  function dailyPlan(rows,state,ledger){
+    const next=clone(state),actions=[],duplicates=[];let id=Math.max(Date.now(),...next.records.map(r=>Number(r.id)||0),...next.schedules.map(r=>Number(r.id)||0));
+    for(const r of rows){
+      try{
+        const matches=next.students.filter(s=>text(s.name)===r.name);if(matches.length!==1)throw new Error(matches.length?'学员重名，请先处理名单。':'未找到学员，请先导入学员课时。');
+        const s=matches[0];if(r.course&&r.course!==s.course&&!text(s.course).split('、').includes(r.course))throw new Error('课程与学员档案不匹配，请使用模板中的课程名称。');
+        const course=r.course||s.course;
+        const base=row=>ledger.related(row,s)&&row.date===r.date&&text(row.teacher)===r.teacher&&(!row.course||row.course===course||row.course===s.course)&&timeKey(row.timeRange)===timeKey(r.timeRange);
+        const sameHours=row=>Math.abs(Number(row.hours)-r.hours)<0.0001;
+        const key=JSON.stringify([s.id,r.date,r.teacher,course,r.timeRange]);
+        const oldRecords=next.records.filter(base),oldSchedules=next.schedules.filter(base);
+        if(oldRecords.length>1||oldSchedules.length>1)throw new Error('同一天有多条相似记录，请补充准确上课时间或在系统中打卡。');
+        if(oldRecords.length){if(!sameHours(oldRecords[0]))throw new Error('已有相同课程日期的消课记录，但课时不同，请先在系统核对。');duplicates.push(r);continue;}
+        const existing=oldSchedules[0];
+        if(existing&&!sameHours(existing))throw new Error('已有排课与填写课时不同，请先修改系统排课。');
+        if(existing&&(r.status==='pending'||existing.consumed)){duplicates.push(r);continue;}
+        if(existing){
+          existing.consumed=true;
+          next.records.unshift({id:++id,scheduleId:existing.id,studentId:s.id,studentName:s.name,course,teacher:r.teacher,date:r.date,hours:r.hours,timeRange:r.timeRange,note:'每日 Excel 填报，匹配已有排课',dailyKey:key,hoursSource:existing.hoursSource||'unscheduled'});
+          actions.push({...r,action:'已有排课打卡'});
+        }else{
+          const current=ledger.summary(s,next.records,next.schedules).current;
+          const unrecorded=round(current.pending-Object.values(ledger.contributions(s,next.records,next.schedules).schedules).reduce((n,v)=>n+v,0));
+          const old=r.source==='老账已排未上',available=old?unrecorded:current.unscheduled;
+          if(r.hours>available+0.0001)throw new Error(`${old?'未补录日程的老账已排未上':'未排待排'}不足（可用 ${round(Math.max(0,available))} 课时）。`);
+          const itemId=++id;
+          if(r.status==='pending'){
+            if(old)ledger.claim(s,r.hours,r.date,'每日 Excel 补录老账日程',{scheduleId:itemId});
+            next.schedules.unshift({id:itemId,studentId:s.id,studentName:s.name,course,teacher:r.teacher,date:r.date,hours:r.hours,timeRange:r.timeRange,consumed:false,hoursSource:old?'old-pending':'unscheduled',dailyKey:key});
+            actions.push({...r,action:old?'补录老账日程':'新增排课'});
+          }else{
+            if(old)ledger.taughtFromPending(s,r.hours,r.date,'每日 Excel 补录老账待上课时',{recordId:itemId});
+            next.records.unshift({id:itemId,studentId:s.id,studentName:s.name,course,teacher:r.teacher,date:r.date,hours:r.hours,timeRange:r.timeRange,note:'每日 Excel 填报',hoursSource:old?'old-pending':'unscheduled',dailyKey:key});
+            actions.push({...r,action:old?'老账待上打卡':'新增消课'});
+          }
+        }
+        ledger.validCurrent(ledger.summary(s,next.records,next.schedules).current);ledger.sync(s,next.records,next.schedules);
+        if(!next.teachers.some(t=>t.name===r.teacher))next.teachers.push({id:++id,name:r.teacher,subject:course,phone:''});
+      }catch(e){throw new Error(`第 ${r.row} 行（${r.name}）：${e.message}`);}
+    }
+    return {state:next,actions,duplicates,dates:[...new Set(rows.map(r=>r.date))].sort()};
+  }
+  return {headers,date,parseRoster,rosterPlan,parseDaily,dailyPlan};
+});

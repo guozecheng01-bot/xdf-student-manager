@@ -1,0 +1,102 @@
+/* Teacher-friendly daily XLSX workflow; student files stay in this browser. */
+(function(){
+  'use strict';
+  const $=id=>document.getElementById(id),esc=v=>appHtml(String(v??''));let pending=null;
+  const snapshot=()=>structuredClone({students,records,schedules,teachers});
+  const localKeys=()=>Object.keys(localStorage).filter(k=>k.startsWith('xdf_'));
+  function tell(message,error=false){$('dx-message').textContent=message;$('dx-message').dataset.error=String(error);}
+  function transaction(next,entry){
+    const before=snapshot(),stored=Object.fromEntries(localKeys().map(k=>[k,localStorage.getItem(k)]));
+    try{appWriteBackupSafetyCopy();students=next.students;records=next.records;schedules=next.schedules;teachers=next.teachers;
+      const history=JSON.parse(localStorage.getItem('xdf_daily_excel_history')||'[]');history.unshift({...entry,at:new Date().toISOString()});localStorage.setItem('xdf_daily_excel_history',JSON.stringify(history.slice(0,100)));persist();
+    }catch(e){students=before.students;records=before.records;schedules=before.schedules;teachers=before.teachers;
+      try{for(const k of localKeys())if(!Object.hasOwn(stored,k))localStorage.removeItem(k);for(const [k,v]of Object.entries(stored))localStorage.setItem(k,v);}catch(_){}
+      try{updateAllViews();}catch(_){}throw e;
+    }
+  }
+  function rosterRows(parsed){return parsed.groups.map(g=>[g.name,g.course,g.teacher||'保留已有 / 待分配',g.totalHours,g.consumedHours,g.totalHours-g.consumedHours,g.scheduledHours-g.consumedHours,g.unscheduledHours,g.totalHours?Math.round(g.consumedHours/g.totalHours*100)+'%':'0%']);}
+  const rosterHead=['学员姓名','课程类型','主讲老师','总购买课时','已排已上','未消剩余','已排未上','未排待排','消课进度'];
+  function table(head,rows){return `<div class="dx-table-wrap"><table class="dx-table"><thead><tr>${head.map(v=>`<th>${esc(v)}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;}
+  async function read(file,force){
+    if(!window.XLSX)throw new Error('Excel 读取组件不可用，请刷新后重试。');if(file.size>25*1024*1024)throw new Error('文件超过 25 MB。');
+    const wb=XLSX.read(new Uint8Array(await file.arrayBuffer()),{type:'array',cellDates:false});
+    for(const name of wb.SheetNames){const matrix=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,defval:null,blankrows:true});
+      for(let i=0;i<Math.min(20,matrix.length);i++){
+        const head=matrix[i].map(v=>String(v??'').trim()),hasName=head.some(v=>['学员姓名','学生姓名','姓名','studentName'].includes(v));if(!hasName)continue;
+        const daily=head.includes('课时')||head.includes('本次课时'),roster=head.some(v=>['lessonNum','总购买课时','总课时','课时数'].includes(v));
+        if((force==='daily'&&!daily)||(force==='roster'&&!roster)||(!daily&&!roster))continue;
+        const rows=matrix.slice(i+1).map(c=>Object.fromEntries(head.map((h,j)=>[h,c[j]??null])));
+        if(daily&&wb.Workbook?.WBProps?.date1904)for(const r of rows)for(const k of ['日期','上课日期'])if(typeof r[k]==='number')r[k]+=1462;
+        return daily?{kind:'daily',rows:XdfDailyExcel.parseDaily(rows,$('dx-date').value),fileName:file.name}:{kind:'roster',parsed:XdfDailyExcel.parseRoster(rows,{repairCompleted:$('dx-repair').checked}),fileName:file.name};
+      }
+    }throw new Error(force==='daily'?'未识别到每日填报表，请下载本系统模板。':'未识别到姓名和课时表头。');
+  }
+  function showPreview(value){
+    pending=value;switchTab('daily-excel');$('dx-preview').hidden=false;
+    if(value.kind==='roster'){
+      const plan=XdfDailyExcel.rosterPlan(value.parsed,snapshot(),XdfHoursLedger);
+      $('dx-preview-title').textContent=`课时包导入：${value.parsed.count} 条课包 → ${value.parsed.groups.length} 位学员`;
+      $('dx-preview-note').textContent=`新增 ${plan.added} 位，更新 ${plan.updated} 位。只读取下列 9 项信息；已有老师、维护信息和历史日程保留，累计余额成为老账，原新账归档。`;
+      $('dx-preview-body').innerHTML=table(rosterHead,rosterRows(value.parsed));
+      $('dx-warnings').textContent=value.parsed.warnings.concat(plan.state.students.filter(s=>s.hoursLedger?.reviewNote).map(s=>s.name+'：已有日历待上课时超过本次余额，请在老账和排课中核对；日程已保留。')).join('\n');
+    }else{
+      const plan=XdfDailyExcel.dailyPlan(value.rows,snapshot(),XdfHoursLedger);
+      $('dx-preview-title').textContent=`每日填报：新增 / 打卡 ${plan.actions.length} 条，跳过重复 ${plan.duplicates.length} 条`;
+      $('dx-preview-note').textContent=`日期：${plan.dates.join('、')}。匹配已有排课时直接打卡，不再重复排课或扣减。老账不被覆盖。`;
+      $('dx-preview-body').innerHTML=table(['学员姓名','课程类型','主讲老师','日期','课时','处理'],[...plan.actions.map(r=>[r.name,r.course||'使用档案课程',r.teacher,r.date,r.hours,r.action]),...plan.duplicates.map(r=>[r.name,r.course||'使用档案课程',r.teacher,r.date,r.hours,'重复，跳过'])]);$('dx-warnings').textContent='';
+    }
+    $('dx-apply').disabled=false;tell('已读取 '+value.fileName+'，核对后点击“一键导入”。');
+  }
+  async function select(event,kind){const file=event.target.files?.[0];if(!file)return;pending=null;$('dx-preview').hidden=true;try{showPreview(await read(file,kind));}catch(e){switchTab('daily-excel');tell('未导入：'+e.message,true);}finally{event.target.value='';}}
+  function apply(){
+    if(!pending)return;$('dx-apply').disabled=true;
+    try{
+      const value=pending,plan=value.kind==='roster'?XdfDailyExcel.rosterPlan(value.parsed,snapshot(),XdfHoursLedger):XdfDailyExcel.dailyPlan(value.rows,snapshot(),XdfHoursLedger);
+      if(value.kind==='daily'&&!plan.actions.length){tell(`全部 ${plan.duplicates.length} 条均已存在，本次未重复导入。`);pending=null;$('dx-preview').hidden=true;return;}
+      transaction(plan.state,{kind:value.kind,fileName:value.fileName,count:value.kind==='roster'?value.parsed.groups.length:plan.actions.length,dates:plan.dates||[]});
+      pending=null;$('dx-preview').hidden=true;renderDay();
+      tell(value.kind==='roster'?`导入完成：${value.parsed.groups.length} 位学员，新增 ${plan.added} 位、更新 ${plan.updated} 位。`:`导入完成：${plan.actions.length} 条已归入 ${plan.dates.join('、')}；重复 ${plan.duplicates.length} 条已跳过。`);
+    }catch(e){tell('未导入：'+e.message+' 当前数据已保留。',true);$('dx-apply').disabled=false;}
+  }
+  function template(){
+    try{
+      if(!window.XLSX)throw new Error('Excel 组件不可用。');const date=XdfDailyExcel.date($('dx-date').value),teacher=$('dx-teacher').value;
+      const wb=XLSX.utils.book_new(),matrix=[XdfDailyExcel.headers,...Array.from({length:30},()=>['','',teacher,date,'','已上课','未排待排',''])],sheet=XLSX.utils.aoa_to_sheet(matrix);
+      sheet['!cols']=[{wch:16},{wch:38},{wch:16},{wch:14},{wch:10},{wch:14},{wch:20},{wch:20}];XLSX.utils.book_append_sheet(wb,sheet,'每日填报');
+      const guide=[['填写说明'],['每节课填一行，必填：学员姓名、主讲老师、课时。课程不填时使用系统档案。'],['日期可修改；日期空白时使用导入页面选定日期。支持一张表填写多个日期。'],['状态：已上课 / 已排未上。留空按已上课处理。'],['课时来源通常为未排待排；补录无日程的历史待上课时，填老账已排未上。'],['已有相同姓名、老师、课程、日期和时间的排课会直接匹配；重复记录跳过。'],['同日同老师同课程有多节课时，请填上课时间，如 09:00-11:00。'],['请勿反复填写累计课时；此表只填每天的本次课时。']];const notes=XLSX.utils.aoa_to_sheet(guide);notes['!cols']=[{wch:100}];XLSX.utils.book_append_sheet(wb,notes,'填写说明');XLSX.writeFile(wb,`老师每日填报_${date}.xlsx`);tell('模板已生成。填写后回到本页选择文件，一键导入。');
+    }catch(e){tell(e.message,true);}
+  }
+  function exportRoster(){
+    if(!window.XLSX){tell('Excel 组件不可用。',true);return;}
+    const data=students.map(s=>{const c=hoursView(s).current;return [s.name,s.course,s.teacher,c.total,c.taught,c.total-c.taught,c.pending,c.unscheduled,c.total?c.taught/c.total:0];});
+    const sheet=XLSX.utils.aoa_to_sheet([rosterHead,...data]);sheet['!cols']=[{wch:16},{wch:48},{wch:20},...Array.from({length:6},()=>({wch:16}))];for(let r=2;r<=data.length+1;r++)if(sheet['I'+r])sheet['I'+r].z='0.0%';const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,sheet,'学员课时');XLSX.writeFile(wb,`学员课时_${appLocalDate()}.xlsx`);
+  }
+  function renderDay(){
+    if(!$('dx-day'))return;const selected=$('dx-teacher').value,all=[...new Set(teachers.map(t=>t.name).concat(students.flatMap(s=>String(s.teacher||'').split('、'))))].filter(v=>v&&v!=='待分配').sort();
+    $('dx-teacher').innerHTML='<option value="">全部老师</option>'+all.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');$('dx-teacher').value=all.includes(selected)?selected:'';
+    const d=$('dx-date').value,t=$('dx-teacher').value,rows=[...records.map(r=>({...r,status:'已上课'})),...schedules.filter(s=>!s.consumed).map(s=>({...s,status:'已排未上'}))].filter(r=>r.date===d&&(!t||r.teacher===t));
+    $('dx-day-summary').textContent=`${d} · ${rows.length} 条 · 已上 ${rows.filter(r=>r.status==='已上课').reduce((n,r)=>n+Number(r.hours),0)} 课时 · 待上 ${rows.filter(r=>r.status==='已排未上').reduce((n,r)=>n+Number(r.hours),0)} 课时`;
+    $('dx-day').innerHTML=rows.length?table(['学员姓名','课程类型','主讲老师','日期','课时','状态','上课时间'],rows.map(r=>[r.studentName,r.course,r.teacher,r.date,r.hours,r.status,r.timeRange||''])):'<p class="dx-help">这一天暂无上课或排课记录。</p>';
+    let history=[];try{history=JSON.parse(localStorage.getItem('xdf_daily_excel_history')||'[]');}catch(_){}
+    $('dx-history').textContent=history.slice(0,8).map(h=>`${h.at.slice(0,10)} · ${h.fileName} · ${h.count} ${h.kind==='roster'?'位学员':'条课时记录'}${h.dates.length?' · '+h.dates.join('、'):''}`).join('\n')||'尚无导入记录';
+  }
+  function install(){
+    const style=document.createElement('link');style.rel='stylesheet';style.href='daily-excel.css';document.head.appendChild(style);
+    const nav=document.createElement('button');nav.type='button';nav.id='nav-daily-excel';nav.className='w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:bg-slate-800 transition-all';nav.textContent='▦ 每日 Excel 填报';nav.onclick=()=>switchTab('daily-excel');$('nav-dashboard').after(nav);
+    const section=document.createElement('section');section.id='tab-daily-excel';section.className='hidden dx-page';section.innerHTML=`
+      <div class="dx-heading"><div><h2>每日 Excel 填报</h2><p>老师在外部表格填写本次上课信息，导入后自动记入对应日期。</p></div><button class="dx-btn" id="dx-export-roster">导出学员课时 Excel</button></div>
+      <div class="dx-card"><h3>1. 生成老师每日填报表</h3><div class="dx-controls"><label>填报 / 查看日期<input id="dx-date" type="date" required></label><label>主讲老师<select id="dx-teacher"><option value="">全部老师</option></select></label><button class="dx-btn dx-primary" id="dx-template">生成每日填报 Excel</button><a class="dx-btn" href="teacher-daily-template.xlsx" download="老师每日填报模板.xlsx">下载空白模板</a></div><p class="dx-help">只需填学员、老师、本次课时；课程可留空。表内日期优先，日期空白时使用上方日期。状态默认“已上课”，也可填“已排未上”。</p></div>
+      <div class="dx-card"><h3>2. 选择表格，一键导入</h3><div class="dx-controls"><button class="dx-btn dx-primary" id="dx-select-daily">选择每日填报 Excel</button><button class="dx-btn" id="dx-select-roster">导入课时包 / 学员老账</button><input id="dx-daily-file" type="file" accept=".xlsx,.xls,.csv" hidden><input id="dx-roster-file" type="file" accept=".xlsx,.xls,.csv" hidden></div><label class="dx-check"><input id="dx-repair" type="checkbox" checked>课时包已上等于总课时却存在待排冲突时，以已上和剩余为准，并在预览中列明修正</label><p class="dx-help">课时包只导入截图中的 9 项信息。每天填报追加到新账，已有排课自动匹配，重复记录跳过；导入前自动备份。</p><p id="dx-message" class="dx-message" role="status" aria-live="polite"></p></div>
+      <div id="dx-preview" class="dx-card" hidden><h3 id="dx-preview-title"></h3><p id="dx-preview-note" class="dx-help"></p><p id="dx-warnings" class="dx-warnings"></p><div id="dx-preview-body"></div><div class="dx-controls" style="margin-top:16px"><button id="dx-apply" class="dx-btn dx-primary">一键导入</button><button id="dx-cancel" class="dx-btn">取消</button></div></div>
+      <div class="dx-card"><h3>当天记录</h3><p id="dx-day-summary" class="dx-help"></p><div id="dx-day"></div></div><div class="dx-card"><h3>最近导入</h3><p id="dx-history" class="dx-history"></p><button class="dx-btn" onclick="appDownloadSafetyCopy()">下载导入前备份</button></div>`;
+    document.querySelector('main').appendChild(section);$('dx-date').value=appLocalDate();
+    const oldSwitch=switchTab;switchTab=function(tab){oldSwitch(tab);section.classList.toggle('hidden',tab!=='daily-excel');nav.classList.toggle('bg-blue-600',tab==='daily-excel');nav.classList.toggle('text-white',tab==='daily-excel');if(tab==='daily-excel'){renderDay();document.querySelector('main').scrollTop=0;}};
+    const oldUpdate=updateAllViews;updateAllViews=function(){oldUpdate();renderDay();};
+    $('dx-date').onchange=()=>{pending=null;$('dx-preview').hidden=true;renderDay();};$('dx-teacher').onchange=renderDay;$('dx-template').onclick=template;$('dx-export-roster').onclick=exportRoster;
+    $('dx-select-daily').onclick=()=>$('dx-daily-file').click();$('dx-select-roster').onclick=()=>$('dx-roster-file').click();$('dx-daily-file').onchange=e=>select(e,'daily');$('dx-roster-file').onchange=e=>select(e,'roster');$('dx-apply').onclick=apply;$('dx-cancel').onclick=()=>{pending=null;$('dx-preview').hidden=true;tell('已取消，数据未改变。');};
+    handleExcelImport=e=>select(e);exportDashboardToExcel=exportRoster;
+    const dashboardRender=renderDashboardTable;renderDashboardTable=function(){dashboardRender();for(const tr of $('dashboard-table-body').rows){while(tr.cells.length>9)tr.deleteCell(9);const id=tr.cells[0]?.querySelector('button')?.getAttribute('onclick')?.match(/\((\d+)\)/)?.[1];if(id){const button=document.createElement('button');button.type='button';button.className='dx-ledger';button.textContent='修改老账 / 新账';button.onclick=()=>openHoursLedger(Number(id));tr.cells[0].appendChild(button);}}};
+    const head=document.querySelector('#tab-dashboard thead tr');while(head.children.length>9)head.lastElementChild.remove();renderDashboardTable();renderDay();
+  }
+  install();
+})();

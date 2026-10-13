@@ -1,0 +1,102 @@
+/* Connect the hour ledger to existing scheduling, attendance, and import flows. */
+'use strict';
+function hoursNotice(message){if(typeof crmToast==='function')crmToast(message);else window.alert(message);}
+function hoursView(s){return XdfHoursLedger.summary(s,records,schedules);}
+function hoursSyncAll(){students.forEach(s=>XdfHoursLedger.sync(s,records,schedules));}
+function hoursNextId(rows){return Math.max(Date.now(),...rows.map(r=>Number(r.id)||0))+1;}
+function hoursLinkLegacyRecords(){
+  const legacy=records.filter(r=>!r.scheduleId&&/根据排课计划.*自动打卡消课/.test(String(r.note||'')));
+  const match=(r,sc)=>String(r.studentId)===String(sc.studentId)&&r.date===sc.date&&r.teacher===sc.teacher&&Math.abs(Number(r.hours)-Number(sc.hours))<0.0001;
+  let changed=false;for(const r of legacy){const candidates=schedules.filter(sc=>sc.consumed&&match(r,sc));if(candidates.length===1&&legacy.filter(other=>match(other,candidates[0])).length===1&&!records.some(other=>other.scheduleId===candidates[0].id)){r.scheduleId=candidates[0].id;changed=true;}}return changed;
+}
+function hoursCommit(student,change){
+  const before=structuredClone({students,records,schedules,appointments,teachers});
+  try{change();XdfHoursLedger.validCurrent(hoursView(student).current);persist();if(currentDetailStudentId===student.id&&!document.getElementById('modal-student-detail').classList.contains('hidden'))showStudentDetailModal(student.id);return true;}
+  catch(e){students=before.students;records=before.records;schedules=before.schedules;appointments=before.appointments;teachers=before.teachers;try{persist();}catch(_){}hoursNotice(e.message);return false;}
+}
+function hoursAvailable(s,source,h){
+  if(!Number.isFinite(h)||h<=0)throw new Error('请输入大于 0 的有效课时。');
+  const q=hoursView(s),available=source==='old-pending'?q.current.pending-Object.values(XdfHoursLedger.contributions(s,records,schedules).schedules).reduce((n,v)=>n+v,0):q.current.unscheduled;
+  if(h>available+0.0001)throw new Error(source==='old-pending'?'没有足够的未补录日程的已排未上课时。已有日程请到排课列表打卡；历史余额有误时请修改老账。':'未排待排课时不足，请先核对老账或登记新购课时。');
+}
+const hoursOriginalPersist=persist;
+persist=function(){deduplicateStudentsRoster();hoursLinkLegacyRecords();hoursSyncAll();hoursOriginalPersist();};
+const hoursOriginalUpdate=updateAllViews;
+updateAllViews=function(){hoursSyncAll();hoursOriginalUpdate();const target=document.getElementById('hours-status-totals');if(target){const sum={taught:0,pending:0,unscheduled:0};for(const s of students){const c=hoursView(s).current;for(const k of Object.keys(sum))sum[k]+=c[k];}target.innerHTML=[['taught','已排已上','已完成上课'],['pending','已排未上','已安排，等待上课'],['unscheduled','未排待排','尚待安排时间']].map(([k,label,hint])=>`<div class="crm-stat"><span>${label}</span><strong>${XdfHoursLedger.round(sum[k])} h</strong><small>${hint}</small></div>`).join('');}};
+
+submitSchedule=function(){
+  const s=students.find(s=>String(s.id)===document.getElementById('sch-student-select').value),date=document.getElementById('sch-date').value,h=Number(document.getElementById('sch-hours').value),teacher=document.getElementById('sch-teacher-input').value.trim(),source=document.getElementById('sch-hours-source').value;
+  if(!s||!date||!teacher){hoursNotice('请选择学员、上课日期并填写老师。');return;}
+  try{hoursAvailable(s,source,h);}catch(e){hoursNotice(e.message);return;}
+  if(hoursCommit(s,()=>{
+    const id=hoursNextId(schedules);if(source==='old-pending')XdfHoursLedger.claim(s,h,date,'补录已有已排未上日程',{scheduleId:id});
+    schedules.unshift({id,studentId:s.id,studentName:s.name,course:s.course,teacher,date,hours:h,timeRange:document.getElementById('sch-time-range').value.trim(),consumed:false,unconsumedReason:'',hoursSource:source});
+    if(!teachers.some(t=>t.name===teacher))teachers.push({id:hoursNextId(teachers),name:teacher,subject:s.course,phone:''});
+  })){closeScheduleModal();hoursNotice(source==='old-pending'?'已补录老账中的待上日程，课时余额未重复扣减。':'排课成功：课时已从未排待排转入已排未上。');}
+};
+convertAppointmentToSchedule=function(apId){
+  const ap=appointments.find(a=>a.id===apId);if(!ap)return;
+  if(isAppointmentTimePending(ap)||!ap.timeRange){hoursNotice('请先补充预约日期和时间，再转正式排课。');showAppointmentModal(ap.id);return;}
+  if(ap.status==='已取消'){hoursNotice('该预约已取消，请先恢复预约。');return;}
+  if(appointmentHasSchedule(ap)){hoursNotice('该预约已转排课，请查看日历。');return;}
+  const s=students.find(s=>s.id===ap.studentId);if(!s){hoursNotice('学员档案已不存在。');return;}
+  const h=Number(ap.hours),source=ap.hoursSource||'unscheduled';try{hoursAvailable(s,source,h);}catch(e){hoursNotice(e.message);return;}
+  if(!confirm(`将 ${s.name} 的 ${h} 课时预约转为正式排课？${source==='old-pending'?'将补录老账已排日程，余额不重复扣减。':'将从未排待排转入已排未上。'}`))return;
+  if(hoursCommit(s,()=>{const id=hoursNextId(schedules);if(source==='old-pending')XdfHoursLedger.claim(s,h,ap.date,'预约补录老账日程',{scheduleId:id});ap.status='预约成功';schedules.unshift({id,appointmentId:ap.id,studentId:s.id,studentName:s.name,course:ap.course||s.course,teacher:ap.teacher,date:ap.date,hours:h,timeRange:ap.timeRange,consumed:false,unconsumedReason:'',hoursSource:source});}))hoursNotice('已转入排课，三类课时已更新。');
+};
+confirmScheduleCheckin=function(id){
+  const sch=schedules.find(r=>r.id===id);if(!sch)return;if(sch.consumed||records.some(r=>r.scheduleId===sch.id)){hoursNotice('这节课已打卡，请勿重复消课。');return;}
+  const s=students.find(s=>s.id===sch.studentId);if(!s){hoursNotice('学员档案已不存在。');return;}
+  const h=Number(sch.hours);if(!Number.isFinite(h)||h<=0){hoursNotice('排课课时无效。');return;}
+  let remainAfter;if(hoursCommit(s,()=>{sch.consumed=true;const rec={id:hoursNextId(records),scheduleId:sch.id,studentId:s.id,studentName:s.name,course:sch.course||s.course,teacher:sch.teacher,date:sch.date,hours:h,note:`按排课 ${sch.timeRange||''} 打卡`};records.unshift(rec);remainAfter=hoursView(s).current.total-hoursView(s).current.taught;rec.remainAfter=remainAfter;})){
+    triggerDingTalkCheckinNotification(s,sch.teacher,sch.date,h,remainAfter);hoursNotice('打卡成功：已排未上转为已排已上。');
+  }
+};
+submitCheckin=function(){
+  const s=students.find(s=>String(s.id)===document.getElementById('checkin-student-select').value),date=document.getElementById('checkin-date').value,h=Number(document.getElementById('checkin-hours').value),teacher=document.getElementById('checkin-teacher-input').value.trim(),note=document.getElementById('checkin-note').value.trim(),source=document.getElementById('checkin-hours-source').value;
+  if(!s||!date||!teacher){hoursNotice('请选择学员、日期和老师。');return;}
+  try{hoursAvailable(s,source,h);}catch(e){hoursNotice(e.message);return;}
+  let remainAfter;if(hoursCommit(s,()=>{const id=hoursNextId(records);if(source==='old-pending')XdfHoursLedger.taughtFromPending(s,h,date,'无日程的老账待上课时打卡',{recordId:id});const rec={id,studentId:s.id,studentName:s.name,course:s.course,teacher,date,hours:h,note,hoursSource:source};records.unshift(rec);const c=hoursView(s).current;remainAfter=c.total-c.taught;rec.remainAfter=remainAfter;})){
+    triggerDingTalkCheckinNotification(s,teacher,date,h,remainAfter);document.getElementById('checkin-hours').value='';document.getElementById('checkin-note').value='';switchTab('dashboard');hoursNotice('课消已登记，老账保留，新账已更新。');
+  }
+};
+revertRecord=function(id){
+  const rec=records.find(r=>r.id===id);if(!rec)return;const s=students.find(s=>s.id===rec.studentId);if(!s){hoursNotice('学员档案已不存在，无法退还课时。');return;}
+  if(!confirm(`撤回 ${s.name} 的 ${rec.hours} 课时打卡？关联的排课将恢复为已排未上。`))return;
+  if(hoursCommit(s,()=>{const sch=schedules.find(sc=>sc.id===rec.scheduleId);if(sch)sch.consumed=false;const ownAdjustment=s.hoursLedger.adjustments.some(a=>a.type==='manual-taught'&&a.recordId===rec.id);s.hoursLedger.adjustments=s.hoursLedger.adjustments.filter(a=>!(a.type==='manual-taught'&&a.recordId===rec.id));if(!sch&&!rec.scheduleId&&rec.hoursSource==='old-pending'&&!ownAdjustment)XdfHoursLedger.restoreTaughtToPending(s,rec.hours,rec.date,'撤回已结转的老账待上打卡',{reversedRecordId:rec.id});records=records.filter(r=>r.id!==rec.id);})){hoursNotice('已撤回打卡，课时已退还。');}
+};
+deleteSchedule=function(id){
+  const sch=schedules.find(r=>r.id===id);if(!sch)return;const s=students.find(s=>s.id===sch.studentId);if(!s){hoursNotice('学员档案已不存在。');return;}
+  if(!confirm(`删除 ${s.name} 的这条排课？${sch.consumed?'已上课时仍保留；退课请撤回对应消课流水。':'该课时将从已排未上退回未排待排。'}`))return;
+  hoursCommit(s,()=>{schedules=schedules.filter(r=>r.id!==id);});
+};
+resetAllSchedulesFromToday=function(){
+  if(!confirm('清空所有尚未打卡的排课？这些课时将退回未排待排，已上课记录保留。'))return;
+  const before=structuredClone(schedules);try{schedules=schedules.filter(s=>s.consumed);students.forEach(s=>XdfHoursLedger.validCurrent(hoursView(s).current));persist();hoursNotice('未上课的排课已清空，课时已退回。');}catch(e){schedules=before;updateAllViews();hoursNotice(e.message);}
+};
+
+function hoursRebaseImported(list,source,names){
+  for(const s of list)if(!names||names.has(String(s.name).trim()))XdfHoursLedger.establish(s,records,schedules,source,'按文件累计余额重新建立老账，导入前的新账已归档。');
+}
+function hoursInstall(){
+  // Preserve the complete pre-migration browser data before writing the new schema.
+  if(students.some(s=>!s.hoursLedger)&&!localStorage.getItem('xdf_before_hours_ledger_backup'))localStorage.setItem('xdf_before_hours_ledger_backup',JSON.stringify(appBackupData()));
+  deduplicateStudentsRoster();
+  if(hoursLinkLegacyRecords())localStorage.setItem('xdf_records',JSON.stringify(records));
+  hoursSyncAll();localStorage.setItem('xdf_students',JSON.stringify(students));
+  const optionHTML='<option value="unscheduled">新增排课 / 打卡：从未排待排扣减</option><option value="old-pending">补录老账已排未上：不重复扣待排</option>';
+  function addSource(anchor,id,label){anchor.insertAdjacentHTML('afterend',`<div class="crm-field" style="margin-top:12px"><label for="${id}">${label}</label><select id="${id}">${optionHTML}</select><span class="crm-field-hint">已有日程请在排课列表打卡；补录只使用尚未录入日程的已排未上余额。</span></div>`);}
+  addSource(document.getElementById('sch-hours').parentElement,'sch-hours-source','课时来源');
+  addSource(document.getElementById('checkin-hours').parentElement,'checkin-hours-source','本次消课来源');
+  addSource(document.getElementById('ap-hours').parentElement,'ap-hours-source','转正式排课时的课时来源');
+  const origShow=showAppointmentModal;showAppointmentModal=function(id=null){origShow(id);const ap=appointments.find(a=>String(a.id)===String(id));document.getElementById('ap-hours-source').value=ap?.hoursSource||'unscheduled';};
+  const origSchedule=showScheduleModal;showScheduleModal=function(){origSchedule();document.getElementById('sch-hours-source').value='unscheduled';};
+  const origQuick=quickCheckin;quickCheckin=function(id){origQuick(id);document.getElementById('checkin-hours-source').value='unscheduled';};
+  const beforeRosterButton=crmDashboardCell;crmDashboardCell=function(s){return beforeRosterButton(s)+`<button type="button" class="crm-btn crm-btn-link" onclick="openHoursLedger(${s.id})">课时老账 / 新账</button>`;};
+  const head=document.getElementById('stu-detail-name').closest('.flex.items-center.justify-between');
+  head.insertAdjacentHTML('afterend','<div class="crm-inline" style="justify-content:space-between"><span class="crm-muted">总课时 = 已排已上 + 已排未上 + 未排待排</span><button type="button" class="crm-btn crm-btn-soft" onclick="openHoursLedger(currentDetailStudentId)">修改老账 / 登记新购课时</button></div>');
+  const banner=document.querySelector('#tab-dashboard .overflow-x-auto');banner.insertAdjacentHTML('beforebegin','<div id="hours-status-totals" class="crm-stats" style="grid-template-columns:repeat(3,minmax(0,1fr));padding:12px 16px"></div><div class="crm-convert-note" style="margin:12px 16px">课时按三类互斥余额计算。点击学员行的“课时老账 / 新账”录入历史默认值；后续排课、打卡和新增购课自动计入新账。</div>');
+  const style=document.createElement('style');style.textContent='#dashboard-table-body td:nth-child(n+4):nth-child(-n+8){white-space:nowrap}#tab-dashboard table{min-width:1320px}#tab-dashboard thead th:nth-child(n+4):nth-child(-n+8){min-width:90px}';document.head.appendChild(style);
+  document.getElementById('stu-detail-scheduled').nextElementSibling.textContent='已安排，尚未上课';
+}
+hoursInstall();

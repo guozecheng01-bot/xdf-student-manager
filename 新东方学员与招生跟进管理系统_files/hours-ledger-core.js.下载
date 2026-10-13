@@ -1,0 +1,64 @@
+/* Three mutually exclusive hour balances. Existing events are captured once,
+   so changing a historical balance never counts those events a second time. */
+(function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;root.XdfHoursLedger=api;})(globalThis,function(){
+  'use strict';
+  const keys=['taught','pending','unscheduled'];
+  const round=n=>{n=Number(n);if(!Number.isFinite(n)||Math.abs(n)>1e9)throw new Error('课时数超出有效范围，请核对输入。');return Math.round((n+Number.EPSILON)*10000)/10000;};
+  const clone=v=>JSON.parse(JSON.stringify(v));
+  const sum=m=>round(Object.values(m).reduce((n,v)=>n+Number(v),0));
+  function hours(v){const n=Number(v);if(!Number.isFinite(n)||n<0)throw new Error('课时必须为大于或等于 0 的有效数字。');return round(n);}
+  function related(row,s){return row.studentId!=null?String(row.studentId)===String(s.id):String(row.studentName||'')===String(s.name);}
+  function contributions(s,records=[],schedules=[]){
+    const capture=rows=>{const map=Object.create(null);for(const r of rows){if(r.id==null)throw new Error('课时记录缺少编号，请先核对备份。');const id=String(r.id);if(Object.hasOwn(map,id))throw new Error('课时记录编号重复，请先核对备份。');map[id]=hours(r.hours||0);}return map;};
+    return {records:capture(records.filter(r=>related(r,s))),schedules:capture(schedules.filter(r=>related(r,s)&&!r.consumed))};
+  }
+  function validate(ledger){
+    if(!ledger||ledger.version!==1||!ledger.baseline||!ledger.captured||!Array.isArray(ledger.adjustments)||!Array.isArray(ledger.baselineHistory))throw new Error('课时老账 / 新账数据格式无效。');
+    for(const k of keys){if(typeof ledger.baseline[k]!=='number'||!Number.isFinite(ledger.baseline[k]))throw new Error('老账课时格式无效。');}
+    for(const k of ['records','schedules']){const m=ledger.captured[k];if(!m||typeof m!=='object'||Array.isArray(m)||Object.values(m).some(n=>typeof n!=='number'||!Number.isFinite(n)||n<0))throw new Error('课时基准记录无效。');}
+    const ids=new Set();for(const a of ledger.adjustments){if(!a||!a.id||ids.has(a.id)||!['purchase','claim','manual-taught'].includes(a.type)||keys.some(k=>typeof a[k]!=='number'||!Number.isFinite(a[k])))throw new Error('新账调整记录无效。');ids.add(a.id);}
+    return ledger;
+  }
+  function establish(s,records=[],schedules=[],source='现有数据',note=''){
+    const captured=contributions(s,records,schedules),taught=hours(s.consumedHours||0),total=hours(s.totalHours||0);
+    const pending=s.scheduledHours!==undefined?round(Number(s.scheduledHours)-taught):(s.unscheduledHours!==undefined?round(total-taught-Number(s.unscheduledHours)):sum(captured.schedules));
+    if(!Number.isFinite(pending))throw new Error('已排课时格式无效。');
+    const unscheduled=round(total-taught-pending);
+    if(s.hoursLedger){s.hoursLedgerArchives=s.hoursLedgerArchives||[];s.hoursLedgerArchives.push({archivedAt:new Date().toISOString(),reason:source,ledger:clone(s.hoursLedger)});}
+    s.hoursLedger={version:1,createdAt:new Date().toISOString(),source,baseline:{taught,pending,unscheduled},captured,adjustments:[],baselineHistory:[]};
+    if(note)s.hoursLedger.note=note;
+    if(pending<0||unscheduled<0||sum(captured.schedules)>pending+0.0001)s.hoursLedger.reviewNote='已有累计值与排课明细可能不一致，请在老账中核对三类课时。原记录已保留。';
+    return s.hoursLedger;
+  }
+  function ensure(s,records=[],schedules=[]){return s.hoursLedger?validate(s.hoursLedger):establish(s,records,schedules);}
+  function withTotal(v){return {...v,total:round(keys.reduce((n,k)=>n+v[k],0))};}
+  function summary(s,records=[],schedules=[]){
+    const ledger=ensure(s,records,schedules),now=contributions(s,records,schedules);
+    const recordDelta=round(sum(now.records)-sum(ledger.captured.records)),pendingDelta=round(sum(now.schedules)-sum(ledger.captured.schedules));
+    const delta={taught:recordDelta,pending:pendingDelta,unscheduled:round(-recordDelta-pendingDelta)};
+    for(const a of ledger.adjustments)for(const k of keys)delta[k]=round(delta[k]+a[k]);
+    const current={};for(const k of keys)current[k]=round(ledger.baseline[k]+delta[k]);
+    return {baseline:withTotal(ledger.baseline),delta:withTotal(delta),current:withTotal(current),ledger};
+  }
+  function sync(s,records=[],schedules=[]){const v=summary(s,records,schedules).current;s.totalHours=v.total;s.consumedHours=v.taught;s.scheduledHours=round(v.taught+v.pending);s.unscheduledHours=v.unscheduled;return v;}
+  function validCurrent(v){if(keys.some(k=>!Number.isFinite(v[k])||Math.abs(v[k])>1e9))throw new Error('课时数超出有效范围，请核对输入。');if(keys.some(k=>v[k]<-0.0001))throw new Error('这次操作会使某类课时小于 0，请先核对老账或可用课时。');}
+  function setBaseline(s,value,records=[],schedules=[],note=''){
+    const q=summary(s,records,schedules),next={};for(const k of keys)next[k]=hours(value[k]);
+    validCurrent(Object.fromEntries(keys.map(k=>[k,round(next[k]+q.delta[k])])));
+    if(round(next.pending+q.delta.pending)<sum(contributions(s,records,schedules).schedules)-0.0001)throw new Error('当前已排未上不能少于日历中仍待上课的课时。请核对老账，或先取消不再需要的排课。');
+    s.hoursLedger.baselineHistory.push({at:new Date().toISOString(),before:clone(s.hoursLedger.baseline),after:clone(next),note:String(note),source:'手工修改老账'});
+    s.hoursLedger.baseline=next;delete s.hoursLedger.reviewNote;return summary(s,records,schedules);
+  }
+  function adjustment(s,type,h,date,note,ref={}){
+    h=hours(h);if(h<=0)throw new Error('新记录课时必须大于 0。');
+    const a={id:'h_'+Date.now()+'_'+Math.random().toString(36).slice(2,10),type,hours:h,date:String(date||''),note:String(note||''),at:new Date().toISOString(),taught:0,pending:0,unscheduled:0,...ref};
+    if(type==='purchase')a.unscheduled=h;else{a.pending=-h;a.unscheduled=h;}
+    s.hoursLedger.adjustments.push(a);return a;
+  }
+  function purchase(s,h,date,note){if(!s.hoursLedger)throw new Error('请先建立老账。');return adjustment(s,'purchase',h,date,note);}
+  function claim(s,h,date,note,ref){return adjustment(s,'claim',h,date,note,ref);}
+  function taughtFromPending(s,h,date,note,ref){return adjustment(s,'manual-taught',h,date,note,ref);}
+  function restoreTaughtToPending(s,h,date,note,ref){const a=adjustment(s,'manual-taught',h,date,note,ref);a.pending=-a.pending;a.unscheduled=-a.unscheduled;return a;}
+  function removeAdjustment(s,id){s.hoursLedger.adjustments=s.hoursLedger.adjustments.filter(a=>a.id!==id);}
+  return {round,related,contributions,validate,establish,ensure,summary,sync,setBaseline,purchase,claim,taughtFromPending,restoreTaughtToPending,removeAdjustment,validCurrent};
+});

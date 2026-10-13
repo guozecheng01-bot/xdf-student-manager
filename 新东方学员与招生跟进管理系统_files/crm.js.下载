@@ -1,0 +1,263 @@
+/* 学员档案与招生跟进：本地浏览器存储，无远程数据请求。 */
+'use strict';
+let prospects = (() => { try { const a = JSON.parse(localStorage.getItem('xdf_prospects') || '[]'); return Array.isArray(a) ? a : []; } catch (_) { return []; } })();
+let crmEditing = null;
+let crmFollowupEditing = null;
+let crmConversionId = null;
+let crmToastTimer = null;
+
+function crmEsc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function crmToday() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+function crmNow() { const d = new Date(); return `${crmToday()}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+function crmNewId(prefix = 'p') { return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2,8)}`; }
+function crmNextStudentId() { return Math.max(Date.now(), ...students.map(s => Number(s.id) || 0)) + 1; }
+function crmDate(value) { return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : ''; }
+function normalizeCRMRecord(record, type = 'student') {
+  if (!record || typeof record !== 'object') return record;
+  ['profile','remarks','phone'].forEach(k => { record[k] = String(record[k] || ''); });
+  record.isGift = record.isGift === true;
+  record.nextFollowupAt = crmDate(record.nextFollowupAt);
+  record.followUps = (Array.isArray(record.followUps) ? record.followUps : []).filter(f => f && typeof f === 'object').map(f => ({
+    ...f, id: f.id || crmNewId('f'), time: String(f.time || f.date || crmNow()),
+    method: ['微信','电话','面谈','其他'].includes(f.method) ? f.method : '其他',
+    action: String(f.action || f.description || ''), result: String(f.result || ''),
+    nextPlan: String(f.nextPlan || ''), nextDate: crmDate(f.nextDate), completed: f.completed === true
+  }));
+  if (type === 'prospect') {
+    record.id = record.id || crmNewId(); record.name = String(record.name || ''); record.course = String(record.course || '');
+    record.enrollmentIntent = ['高','中','低'].includes(record.enrollmentIntent) ? record.enrollmentIntent : '未评估';
+    record.status = ['待联系','跟进中','已报名','暂不报名'].includes(record.status) ? record.status : '待联系';
+  } else record.renewalIntent = ['高','中','低'].includes(record.renewalIntent) ? record.renewalIntent : '未评估';
+  return record;
+}
+function crmFind(type, id) { return (type === 'prospect' ? prospects : students).find(s => String(s.id) === String(id)); }
+function crmSortedFollowups(r) { return [...(r.followUps || [])].sort((a,b) => String(b.time).localeCompare(String(a.time))); }
+function crmNextDate(r) {
+  const pending = (r.followUps || []).filter(f => f.nextDate && !f.completed).map(f => f.nextDate);
+  if (r.nextFollowupAt) pending.push(r.nextFollowupAt);
+  return pending.sort()[0] || '';
+}
+function crmPendingOnlyDate(r) { return (r.followUps || []).filter(f => f.nextDate && !f.completed).map(f => f.nextDate).sort()[0] || ''; }
+function crmIsDue(r, type = 'student') { const d = crmNextDate(r); return !!d && d <= crmToday() && !(type === 'prospect' && (r.convertedStudentId || r.status === '暂不报名')); }
+function crmIntentBadge(intent) { const v = ['高','中','低'].includes(intent) ? intent : '未评估'; return `<span class="crm-badge crm-intent-${v === '高' ? 'high' : v === '中' ? 'medium' : v === '低' ? 'low' : 'none'}">${crmEsc(v)}</span>`; }
+function crmGiftBadge(record) { return record?.isGift === true ? '<span class="crm-badge crm-gift" aria-label="赠送学员">赠送</span>' : ''; }
+function crmSummary(value, fallback = '未填写') { return `<span class="crm-summary" title="${crmEsc(value)}">${crmEsc(value || fallback)}</span>`; }
+function crmButton(action, type, id, label, style = '') { return `<button type="button" class="crm-btn ${style}" data-crm-action="${action}" data-crm-type="${type}" data-crm-id="${crmEsc(id)}">${label}</button>`; }
+function crmFollowDateCell(r, type) { const d = crmNextDate(r); return d ? `<span class="${crmIsDue(r,type) ? 'crm-due' : 'crm-muted'}">${crmEsc(d)}${crmIsDue(r,type) ? ' · 待跟进' : ''}</span>` : '<span class="crm-muted">未设置</span>'; }
+function crmDashboardCell(s) {
+  normalizeCRMRecord(s); const f = crmSortedFollowups(s)[0];
+  return `<div class="crm-dashboard-cell"><div class="crm-inline">${crmGiftBadge(s)}${crmIntentBadge(s.renewalIntent)} ${crmButton('open','student',s.id,'维护档案','crm-btn-link')}</div>${crmSummary(s.profile,'画像待完善')}${f ? crmSummary(f.action,'暂无跟进') : ''}<div>${crmFollowDateCell(s,'student')}</div></div>`;
+}
+function crmToast(message, error = false) {
+  const el = document.getElementById('crm-toast'); if (!el) return;
+  el.textContent = message; el.classList.toggle('crm-toast-error',error); el.hidden = false;
+  clearTimeout(crmToastTimer); crmToastTimer = setTimeout(() => { el.hidden = true; }, 4200);
+}
+function crmOpenDialog(id) { const d = document.getElementById(id); if (!d.open) d.showModal(); }
+function crmCloseDialog(id) { document.getElementById(id).close(); if (id === 'crm-record-dialog') crmEditing = null; }
+
+function renderCRMViews() {
+  students.forEach(s => normalizeCRMRecord(s)); prospects.forEach(p => normalizeCRMRecord(p,'prospect'));
+  const q = (document.getElementById('crm-student-search')?.value || '').trim().toLowerCase();
+  const intent = document.getElementById('crm-student-intent')?.value || '';
+  const giftFilter = document.getElementById('crm-student-gift')?.value || '';
+  const dueOnly = document.getElementById('crm-student-due')?.checked;
+  const visible = students.filter(s => (!q || [s.name,s.phone,s.course,s.teacher,s.profile,s.remarks,s.isGift ? '赠送' : '',...s.followUps.map(f=>f.action)].join(' ').toLowerCase().includes(q)) && (!intent || s.renewalIntent===intent) && (!giftFilter || s.isGift === (giftFilter === 'gift')) && (!dueOnly || crmIsDue(s)));
+  const target = document.getElementById('crm-student-tbody');
+  if (target) target.innerHTML = visible.length ? visible.map(s => {
+    const last = crmSortedFollowups(s)[0];
+    return `<tr class="${crmIsDue(s) ? 'crm-row-due' : ''}"><td><button class="crm-name" data-crm-action="open" data-crm-type="student" data-crm-id="${crmEsc(s.id)}">${crmEsc(s.name)}</button> ${crmGiftBadge(s)}<small>${crmEsc(s.phone || '未登记电话')}</small><small>${crmEsc(s.course)}</small></td><td>${crmIntentBadge(s.renewalIntent)}</td><td>${crmSummary(s.profile,'点击维护画像')}</td><td>${crmSummary(s.remarks)}</td><td>${last ? `<span>${crmEsc(last.time.replace('T',' ').slice(0,16))}</span>${crmSummary(last.action)}` : '<span class="crm-muted">暂无跟进记录</span>'}</td><td>${crmFollowDateCell(s,'student')}</td><td><div class="crm-table-actions">${crmButton('open','student',s.id,'维护档案','crm-btn-link')}${crmButton('follow','student',s.id,'＋ 跟进','crm-btn-soft')}</div></td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="crm-empty">没有匹配的学员。可清除筛选，或在下方新增学员。</td></tr>';
+  const counts = document.getElementById('crm-student-count'); if (counts) counts.textContent = `${visible.length} / ${students.length} 人`;
+  const dueCount = students.filter(s=>crmIsDue(s)).length;
+  document.getElementById('crm-student-due-count').textContent = `${dueCount} 人待跟进`;
+  const pq = (document.getElementById('crm-prospect-search')?.value || '').trim().toLowerCase();
+  const pi = document.getElementById('crm-prospect-intent')?.value || '';
+  const ps = document.getElementById('crm-prospect-status')?.value || '';
+  const pd = document.getElementById('crm-prospect-due')?.checked;
+  const pv = prospects.filter(p => (!pq || [p.name,p.phone,p.course,p.profile,p.remarks,...p.followUps.map(f=>f.action)].join(' ').toLowerCase().includes(pq)) && (!pi || p.enrollmentIntent===pi) && (!ps || p.status===ps) && (!pd || crmIsDue(p,'prospect')));
+  document.getElementById('crm-prospect-count').textContent = `${pv.length} / ${prospects.length} 人`;
+  document.getElementById('crm-prospect-total').textContent = prospects.filter(p=>!p.convertedStudentId && p.status!=='暂不报名').length;
+  document.getElementById('crm-prospect-high').textContent = prospects.filter(p=>p.enrollmentIntent==='高'&&!p.convertedStudentId&&p.status!=='暂不报名').length;
+  document.getElementById('crm-prospect-due-count').textContent = prospects.filter(p=>crmIsDue(p,'prospect')).length;
+  document.getElementById('crm-prospect-converted').textContent = prospects.filter(p=>p.convertedStudentId).length;
+  document.getElementById('crm-prospect-tbody').innerHTML = pv.length ? pv.map(p => {
+    const last = crmSortedFollowups(p)[0]; const terminal = !!p.convertedStudentId;
+    return `<tr class="${crmIsDue(p,'prospect') ? 'crm-row-due' : ''}"><td><button class="crm-name" data-crm-action="open" data-crm-type="prospect" data-crm-id="${crmEsc(p.id)}">${crmEsc(p.name)}</button> ${crmGiftBadge(p)}<small>${crmEsc(p.phone || '未登记电话')}</small></td><td>${crmSummary(p.course,'待沟通')}${crmSummary(p.profile,'画像待完善')}</td><td>${crmIntentBadge(p.enrollmentIntent)}</td><td><span class="crm-badge ${terminal ? 'crm-status-success' : 'crm-status'}">${crmEsc(p.status)}${terminal ? ' · 已转正式' : ''}</span></td><td>${crmSummary(p.remarks)}${last ? `<small>${crmEsc(last.time.replace('T',' ').slice(0,16))}</small>${crmSummary(last.action)}` : '<small>暂无跟进记录</small>'}</td><td>${crmFollowDateCell(p,'prospect')}</td><td><div class="crm-table-actions">${crmButton('open','prospect',p.id,'查看 / 编辑','crm-btn-link')}${terminal ? crmButton('converted','prospect',p.id,'正式档案','crm-btn-soft') : `${crmButton('follow','prospect',p.id,'＋ 跟进','crm-btn-soft')}${crmButton('convert','prospect',p.id,'转正式','crm-btn-primary')}`}</div></td></tr>`;
+  }).join('') : `<tr><td colspan="7" class="crm-empty"><strong>${prospects.length ? '没有匹配的预备学员' : '从第一位有意向的学员开始'}</strong><span>${prospects.length ? '调整搜索词或筛选条件后重试。' : '先记录需求和报名意向，再安排一次跟进。报名后可一键转为正式学员。'}</span>${prospects.length ? '' : '<button class="crm-btn crm-btn-primary" data-crm-action="new">＋ 新增预备学员</button>'}</td></tr>`;
+  const badge = document.getElementById('crm-prospect-nav-count'); if (badge) badge.textContent = prospects.filter(p=>crmIsDue(p,'prospect')).length || '';
+}
+
+function crmOpenRecord(type, id) {
+  const fresh = type === 'prospect' && (id === undefined || id === null || id === '');
+  const r = fresh ? normalizeCRMRecord({id:crmNewId(),name:'',phone:'',course:'',status:'待联系'},'prospect') : crmFind(type,id);
+  if (!r) { crmToast('档案不存在或已被删除。',true); return; }
+  normalizeCRMRecord(r,type); crmEditing = {type,id:r.id,fresh};
+  document.getElementById('crm-record-title').textContent = fresh ? '新增预备学员' : `${r.name} · ${type === 'prospect' ? '预备学员档案' : '学员维护档案'}`;
+  document.getElementById('crm-record-subtitle').textContent = type === 'prospect' ? '记录报名需求、画像与每一次沟通。' : '完善画像，判断续费意向，持续记录跟进。';
+  document.getElementById('crm-record-name').value = r.name;
+  document.getElementById('crm-record-name').readOnly = type !== 'prospect' || !!r.convertedStudentId;
+  document.getElementById('crm-record-phone').value = r.phone;
+  document.getElementById('crm-record-is-gift').checked = r.isGift;
+  document.getElementById('crm-record-course').value = r.course || '';
+  document.getElementById('crm-record-course').readOnly = type !== 'prospect' || !!r.convertedStudentId;
+  document.getElementById('crm-record-intent-label').textContent = type === 'prospect' ? '报名意向' : '续费意向';
+  document.getElementById('crm-record-intent').value = type === 'prospect' ? r.enrollmentIntent : r.renewalIntent;
+  document.getElementById('crm-record-status-wrap').hidden = type !== 'prospect';
+  document.getElementById('crm-record-status').value = r.status || '待联系';
+  document.getElementById('crm-record-status').disabled = !!r.convertedStudentId;
+  document.getElementById('crm-record-profile').value = r.profile;
+  document.getElementById('crm-record-remarks').value = r.remarks;
+  document.getElementById('crm-record-next').value = r.nextFollowupAt;
+  document.getElementById('crm-record-delete').hidden = type !== 'prospect' || fresh;
+  document.getElementById('crm-record-convert').hidden = type !== 'prospect' || fresh || !!r.convertedStudentId;
+  document.getElementById('crm-record-linked').hidden = !r.convertedStudentId;
+  document.getElementById('crm-record-add-follow').disabled = fresh;
+  document.getElementById('crm-record-history-help').textContent = fresh ? '先保存档案，再添加第一条跟进。' : '每次沟通单独记录，历史不会被覆盖。';
+  document.getElementById('crm-record-error').textContent = '';
+  crmRenderHistory(r,type); crmOpenDialog('crm-record-dialog');
+}
+function crmSaveRecord(event, close = true) {
+  event.preventDefault(); if (!crmEditing) return false;
+  const {type,id,fresh} = crmEditing; const old = fresh ? {} : crmFind(type,id);
+  if (!old) return false;
+  const name = document.getElementById('crm-record-name').value.trim();
+  if (!name) { document.getElementById('crm-record-error').textContent = '请填写学员姓名。'; return false; }
+  const phone = document.getElementById('crm-record-phone').value.trim();
+  if (type === 'prospect' && prospects.some(p=>String(p.id)!==String(id) && p.name.trim()===name && String(p.phone||'').trim()===phone)) { document.getElementById('crm-record-error').textContent = '该姓名和电话的预备学员已存在，请维护已有档案。'; return false; }
+  Object.assign(old, {id,phone,isGift:document.getElementById('crm-record-is-gift').checked,profile:document.getElementById('crm-record-profile').value.trim(),remarks:document.getElementById('crm-record-remarks').value.trim(),nextFollowupAt:document.getElementById('crm-record-next').value});
+  if (type==='prospect') {
+    Object.assign(old,{name,course:document.getElementById('crm-record-course').value.trim(),enrollmentIntent:document.getElementById('crm-record-intent').value,status:old.convertedStudentId ? '已报名' : document.getElementById('crm-record-status').value});
+    if (fresh) prospects.push(normalizeCRMRecord(old,'prospect'));
+  } else old.renewalIntent = document.getElementById('crm-record-intent').value;
+  persist(); if(close){crmCloseDialog('crm-record-dialog'); crmToast(fresh ? '预备学员已建档，可以开始跟进了。' : '档案已保存。');} return true;
+}
+function crmRenderHistory(r,type) {
+  const fs = crmSortedFollowups(r); document.getElementById('crm-history-count').textContent = `${fs.length} 条`;
+  document.getElementById('crm-record-history').innerHTML = fs.length ? fs.map(f=>`<article class="crm-history-item"><div class="crm-history-head"><strong>${crmEsc(f.time.replace('T',' ').slice(0,16))}</strong><span class="crm-badge crm-status">${crmEsc(f.method)}</span><span class="crm-history-actions"><button type="button" class="crm-btn crm-btn-link" data-crm-action="edit-follow" data-crm-type="${type}" data-crm-id="${crmEsc(r.id)}" data-crm-follow-id="${crmEsc(f.id)}">编辑</button><button type="button" class="crm-btn crm-btn-danger-link" data-crm-action="delete-follow" data-crm-type="${type}" data-crm-id="${crmEsc(r.id)}" data-crm-follow-id="${crmEsc(f.id)}">删除</button></span></div><p class="crm-history-action">${crmEsc(f.action)}</p>${f.result ? `<p><b>反馈结果</b>${crmEsc(f.result)}</p>` : ''}${f.nextPlan ? `<p><b>下一步</b>${crmEsc(f.nextPlan)}</p>` : ''}${f.nextDate ? `<div class="crm-follow-task ${!f.completed && f.nextDate<=crmToday() ? 'crm-follow-task-due' : ''}"><span>${f.completed ? '✓ 已完成计划' : '○ 待完成计划'} · ${crmEsc(f.nextDate)}</span><button type="button" class="crm-btn crm-btn-link" data-crm-action="toggle-follow" data-crm-type="${type}" data-crm-id="${crmEsc(r.id)}" data-crm-follow-id="${crmEsc(f.id)}">${f.completed ? '重新待跟进' : '标记完成'}</button></div>` : ''}</article>`).join('') : '<div class="crm-history-empty">暂无跟进记录。记录一次沟通，保留动作、反馈和下一步计划。</div>';
+}
+function crmOpenFollowup(type,id,followId) {
+  const r=crmFind(type,id); if (!r) return; const f=(r.followUps || []).find(f=>String(f.id)===String(followId));
+  crmFollowupEditing={type,id,followId:f?.id || null};
+  document.getElementById('crm-follow-title').textContent = `${f ? '编辑' : '新增'}跟进 · ${r.name}`;
+  document.getElementById('crm-follow-time').value=(f?.time || crmNow()).slice(0,16);
+  document.getElementById('crm-follow-method').value=f?.method || '微信';
+  document.getElementById('crm-follow-action').value=f?.action || '';
+  document.getElementById('crm-follow-result').value=f?.result || '';
+  document.getElementById('crm-follow-plan').value=f?.nextPlan || '';
+  document.getElementById('crm-follow-next').value=f?.nextDate || '';
+  document.getElementById('crm-follow-completed').checked=f?.completed || false;
+  document.getElementById('crm-follow-error').textContent=''; crmOpenDialog('crm-follow-dialog');
+}
+function crmSaveFollowup(event) {
+  event.preventDefault(); if (!crmFollowupEditing) return;
+  const {type,id,followId}=crmFollowupEditing; const r=crmFind(type,id); if (!r) return;
+  const action=document.getElementById('crm-follow-action').value.trim(); const time=document.getElementById('crm-follow-time').value;
+  if (!action || !time) { document.getElementById('crm-follow-error').textContent='请填写跟进时间和具体动作。'; return; }
+  const old=r.followUps.find(f=>String(f.id)===String(followId)); const oldDate=old?.nextDate || '';
+  const data={id:old?.id || crmNewId('f'),time,method:document.getElementById('crm-follow-method').value,action,result:document.getElementById('crm-follow-result').value.trim(),nextPlan:document.getElementById('crm-follow-plan').value.trim(),nextDate:document.getElementById('crm-follow-next').value,completed:document.getElementById('crm-follow-completed').checked};
+  if (old) Object.assign(old,data); else r.followUps.push(data);
+  if (oldDate && r.nextFollowupAt===oldDate) r.nextFollowupAt='';
+  const next=crmPendingOnlyDate(r); if (next && (!r.nextFollowupAt || next < r.nextFollowupAt)) r.nextFollowupAt=next;
+  if (type==='prospect' && r.status==='待联系') r.status='跟进中';
+  persist(); crmCloseDialog('crm-follow-dialog'); crmToast('跟进记录已保存。');
+  if (document.getElementById('crm-record-dialog').open && crmEditing?.type===type && String(crmEditing.id)===String(id)) { crmRenderHistory(r,type); document.getElementById('crm-record-next').value=r.nextFollowupAt; document.getElementById('crm-record-status').value=r.status || '待联系'; }
+}
+function crmDeleteFollowup(type,id,followId) {
+  const r=crmFind(type,id); if (!r || !confirm('确定删除这条跟进记录？删除后无法恢复。')) return;
+  const f=r.followUps.find(f=>String(f.id)===String(followId)); r.followUps=r.followUps.filter(f=>String(f.id)!==String(followId));
+  if (f?.nextDate && r.nextFollowupAt===f.nextDate) r.nextFollowupAt=crmPendingOnlyDate(r);
+  persist(); if (document.getElementById('crm-record-dialog').open) { crmRenderHistory(r,type); document.getElementById('crm-record-next').value=r.nextFollowupAt; } crmToast('跟进记录已删除。');
+}
+function crmToggleFollowup(type,id,followId) {
+  const r=crmFind(type,id); const f=r?.followUps.find(f=>String(f.id)===String(followId)); if (!f) return;
+  f.completed=!f.completed; if (r.nextFollowupAt===f.nextDate) r.nextFollowupAt='';
+  const next=crmPendingOnlyDate(r); if(next && (!r.nextFollowupAt || next<r.nextFollowupAt)) r.nextFollowupAt=next;
+  persist(); crmRenderHistory(r,type); document.getElementById('crm-record-next').value=r.nextFollowupAt; crmToast(f.completed ? '该跟进计划已标记完成。' : '该计划已重新设为待跟进。');
+}
+function crmDeleteProspect(id) {
+  const p=crmFind('prospect',id); if (!p || !confirm(`确定删除预备学员「${p.name}」及其全部跟进记录？${p.convertedStudentId ? '已转入的正式学员档案会保留。' : ''}`)) return;
+  prospects=prospects.filter(p=>String(p.id)!==String(id)); persist(); crmCloseDialog('crm-record-dialog'); crmToast('预备学员已删除。');
+}
+function crmOpenConvert(id) {
+  const p=crmFind('prospect',id); if (!p) return;
+  if (p.convertedStudentId) { crmToast('该预备学员已经转为正式学员。'); return; }
+  crmConversionId=id; document.getElementById('crm-convert-name').textContent=p.name;
+  document.getElementById('crm-convert-course').value=p.course || '专升本专业课一对一';
+  document.getElementById('crm-convert-hours').value=''; document.getElementById('crm-convert-teacher').value='';
+  const duplicate=students.find(s=>String(s.name).trim()===p.name.trim() || (p.phone.trim() && String(s.phone || '').trim()===p.phone.trim()));
+  document.getElementById('crm-convert-error').textContent=duplicate ? `正式学员中已有同姓名或同电话档案「${duplicate.name}」。请先核对并修改信息，避免重复建档。` : '';
+  document.getElementById('crm-convert-submit').disabled=!!duplicate; crmOpenDialog('crm-convert-dialog');
+}
+function crmConvert(event) {
+  event.preventDefault(); const p=crmFind('prospect',crmConversionId); if (!p || p.convertedStudentId) return;
+  const course=document.getElementById('crm-convert-course').value.trim(); const totalHours=Number(document.getElementById('crm-convert-hours').value); const teacher=document.getElementById('crm-convert-teacher').value.trim() || '待分配';
+  const duplicate=students.find(s=>String(s.name).trim()===p.name.trim() || (p.phone.trim() && String(s.phone || '').trim()===p.phone.trim()));
+  if (duplicate || !course || !Number.isFinite(totalHours) || totalHours<=0) { document.getElementById('crm-convert-error').textContent=duplicate ? '发现已有同姓名或同电话的正式学员，无法重复建档。' : '请填写课程和大于 0 的购买课时。'; return; }
+  const s=normalizeCRMRecord({id:crmNextStudentId(),name:p.name,phone:p.phone,course,totalHours,consumedHours:0,teacher,isGift:p.isGift,profile:p.profile,renewalIntent:'未评估',remarks:p.remarks,nextFollowupAt:p.nextFollowupAt,followUps:JSON.parse(JSON.stringify(p.followUps)),sourceProspectId:p.id});
+  students.push(s); p.status='已报名'; p.convertedStudentId=s.id; persist(); crmCloseDialog('crm-convert-dialog'); crmCloseDialog('crm-record-dialog'); switchTab('students'); crmToast(`${p.name} 已转为正式学员，画像、备注和跟进历史已保留。`);
+}
+function crmExportFollowups() {
+  return [...students.map(r=>({r,type:'正式学员'})),...prospects.map(r=>({r,type:'预备学员'}))].flatMap(({r,type})=>crmSortedFollowups(r).map(f=>({'学员类型':type,'学员姓名':r.name,'联系电话':r.phone || '','跟进时间':f.time.replace('T',' '),'跟进方式':f.method,'跟进动作描述':f.action,'反馈结果':f.result,'下一步计划':f.nextPlan,'下次跟进日期':f.nextDate,'计划状态':f.nextDate ? (f.completed ? '已完成' : '待跟进') : '未设置'})));
+}
+function crmExportProspects() { return prospects.map(p=>({'学员姓名':p.name,'联系电话':p.phone,'意向课程':p.course,'学员画像':p.profile,'报名意向':p.enrollmentIntent,'跟进状态':p.status,'自定义备注':p.remarks,'下次跟进日期':crmNextDate(p),'最近跟进':crmSortedFollowups(p)[0]?.action || '','跟进记录数':p.followUps.length,'正式学员编号':p.convertedStudentId || ''})); }
+function crmDownloadProspects() {
+  if (typeof XLSX==='undefined') { crmToast('Excel 导出组件未加载，请稍后重试。',true); return; }
+  const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(crmExportProspects()),'预备学员'); XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(crmExportFollowups().filter(f=>f['学员类型']==='预备学员')),'招生跟进明细'); XLSX.writeFile(wb,`XDF_预备学员与跟进_${crmToday()}.xlsx`);
+}
+
+function crmInstallUI() {
+  const style=document.createElement('style'); style.textContent=`
+    .crm-panel{background:white;border:1px solid #e2e8f0;border-radius:14px;box-shadow:0 2px 3px #0f172a04;overflow:hidden}.crm-panel-head{padding:22px 24px 18px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.crm-panel h2,.crm-page-title{font-size:22px;font-weight:750;color:#0f172a;letter-spacing:-.4px}.crm-panel h3{font-size:17px;font-weight:750;color:#0f172a}.crm-subtitle{font-size:13px;color:#64748b;line-height:1.7;margin-top:5px}.crm-inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.crm-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:16px 24px;border-top:1px solid #f1f5f9;border-bottom:1px solid #e2e8f0;background:#f8fafc}.crm-input,.crm-select{border:1px solid #cbd5e1;border-radius:8px;background:white;color:#334155;padding:9px 11px;font-size:13px;min-height:39px}.crm-input:focus,.crm-select:focus,.crm-field input:focus,.crm-field textarea:focus,.crm-field select:focus{outline:2px solid #bfdbfe;outline-offset:1px;border-color:#3b82f6}.crm-toolbar .crm-input{min-width:220px;flex:1;max-width:380px}.crm-checkbox{font-size:12px;color:#475569;display:flex;align-items:center;gap:7px;white-space:nowrap}.crm-count{font-size:12px;color:#64748b;margin-left:auto}.crm-btn{border:1px solid #cbd5e1;border-radius:8px;padding:8px 12px;line-height:1.4;font-size:12px;font-weight:600;cursor:pointer;background:white;color:#334155;white-space:nowrap}.crm-btn:hover{background:#f8fafc}.crm-btn:disabled{opacity:.5;cursor:not-allowed}.crm-btn-primary{background:#2563eb;border-color:#2563eb;color:white}.crm-btn-primary:hover{background:#1d4ed8}.crm-btn-soft{background:#eff6ff;color:#1d4ed8;border-color:#dbeafe}.crm-btn-link{color:#2563eb;border-color:transparent;background:transparent;padding:5px 6px}.crm-btn-danger-link{color:#be123c;border-color:transparent;background:transparent;padding:5px 6px}.crm-table-wrap{overflow:auto}.crm-table{width:100%;border-collapse:collapse;text-align:left;font-size:13px;min-width:1060px}.crm-table th{padding:12px 18px;background:#f8fafc;color:#64748b;font-size:11px;font-weight:700;white-space:nowrap;letter-spacing:.1px}.crm-table td{padding:16px 18px;border-top:1px solid #f1f5f9;vertical-align:top;color:#475569}.crm-table td:nth-child(3),.crm-table td:nth-child(4),.crm-table td:nth-child(5){max-width:220px}.crm-table tr:hover td{background:#f8fbff}.crm-table small{display:block;color:#94a3b8;font-size:11px;margin-top:5px}.crm-name{border:0;background:transparent;color:#0f172a;font-weight:700;cursor:pointer;text-align:left;font-size:14px}.crm-name:hover{color:#2563eb}.crm-summary{display:block;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.6}.crm-badge{display:inline-block;border-radius:6px;padding:3px 9px;font-size:11px;font-weight:650;white-space:nowrap}.crm-intent-high{color:#047857;background:#ecfdf5;border:1px solid #a7f3d0}.crm-intent-medium{color:#a16207;background:#fffbeb;border:1px solid #fde68a}.crm-intent-low{color:#64748b;background:#f1f5f9;border:1px solid #e2e8f0}.crm-intent-none{color:#64748b;background:#f8fafc;border:1px dashed #cbd5e1}.crm-status{background:#f1f5f9;color:#475569}.crm-status-success{background:#ecfdf5;color:#047857}.crm-due{color:#b45309;font-size:12px;font-weight:650}.crm-muted{color:#94a3b8;font-size:12px}.crm-row-due td:first-child{border-left:3px solid #f59e0b}.crm-table-actions{display:flex;gap:4px;align-items:center;flex-wrap:wrap;max-width:195px}.crm-empty{text-align:center;padding:52px 20px!important;color:#94a3b8!important}.crm-empty strong{display:block;font-size:16px;color:#334155;margin-bottom:8px}.crm-empty span{display:block;margin-bottom:20px}.crm-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:22px 0}.crm-stat{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:19px 22px}.crm-stat span{font-size:12px;color:#64748b}.crm-stat strong{display:block;font-size:28px;font-weight:750;line-height:1.5;color:#0f172a;margin-top:4px}.crm-stat small{font-size:11px;color:#94a3b8}.crm-stat-accent strong{color:#2563eb}.crm-stat-due strong{color:#d97706}.crm-data-note{padding:11px 16px;background:#eff6ff;border:1px solid #dbeafe;border-radius:10px;color:#1e40af;font-size:12px;line-height:1.7;display:flex;align-items:center;gap:12px;justify-content:space-between}.crm-data-note .crm-btn{flex-shrink:0;background:white;border-color:#bfdbfe;color:#1d4ed8}.crm-page-head{display:flex;justify-content:space-between;align-items:center;gap:16px}.crm-dialog{border:0;border-radius:18px;padding:0;width:min(840px,calc(100vw - 32px));max-height:90vh;box-shadow:0 24px 80px #0f172a40;background:white;color:#334155;margin:auto}.crm-dialog::backdrop{background:#0f172a70;backdrop-filter:blur(2px)}.crm-dialog-small{width:min(560px,calc(100vw - 32px))}.crm-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:24px 28px 20px;border-bottom:1px solid #e2e8f0}.crm-dialog-title{font-size:20px;font-weight:750;color:#0f172a}.crm-dialog-subtitle{font-size:12px;color:#64748b;margin-top:5px;line-height:1.7}.crm-close{border:0;background:#f1f5f9;border-radius:8px;color:#64748b;cursor:pointer;width:32px;height:32px;flex-shrink:0;font-size:20px;line-height:1}.crm-form-body{padding:22px 28px}.crm-grid{display:grid;grid-template-columns:1fr 1fr;gap:17px}.crm-field{display:flex;flex-direction:column;gap:7px;min-width:0}.crm-field label{font-size:12px;font-weight:650;color:#475569}.crm-field input,.crm-field textarea,.crm-field select{width:100%;padding:10px 11px;border:1px solid #cbd5e1;background:white;border-radius:8px;color:#334155;font-size:13px;line-height:1.6;box-sizing:border-box}.crm-field input:read-only{background:#f8fafc;color:#64748b}.crm-field textarea{resize:vertical;min-height:82px}.crm-field-full{grid-column:1/-1}.crm-field-hint{font-size:11px;color:#94a3b8;line-height:1.6}.crm-error{font-size:12px;color:#be123c;line-height:1.7;min-height:18px;margin-top:12px}.crm-dialog-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 28px;border-top:1px solid #e2e8f0;background:#f8fafc;position:sticky;bottom:0}.crm-history{padding:0 28px 24px}.crm-history-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:2px 0 16px;padding-top:20px;border-top:1px solid #e2e8f0}.crm-history-heading h3{font-size:16px;font-weight:750;color:#0f172a}.crm-history-help{font-size:12px;color:#94a3b8;margin-top:4px}.crm-history-item{border:1px solid #e2e8f0;border-left:3px solid #bfdbfe;border-radius:10px;padding:14px 16px;margin-top:12px;background:white}.crm-history-head{display:flex;align-items:center;gap:8px;font-size:12px;flex-wrap:wrap}.crm-history-actions{margin-left:auto;display:flex;gap:3px}.crm-history-item p{font-size:12px;line-height:1.8;margin-top:7px;white-space:pre-wrap;overflow-wrap:anywhere;color:#64748b}.crm-history-item p b{font-weight:650;color:#475569;margin-right:12px}.crm-history-item .crm-history-action{font-size:13px;color:#334155;margin-top:9px}.crm-history-empty{font-size:12px;color:#94a3b8;text-align:center;padding:25px;background:#f8fafc;border:1px dashed #e2e8f0;border-radius:10px}.crm-follow-task{font-size:11px;display:flex;justify-content:space-between;align-items:center;gap:8px;border-radius:6px;background:#f8fafc;padding:7px 10px;margin-top:12px;color:#64748b}.crm-follow-task-due{background:#fffbeb;color:#b45309}.crm-convert-note{border:1px solid #dbeafe;background:#eff6ff;color:#1e40af;border-radius:9px;padding:12px;font-size:12px;line-height:1.8;margin-bottom:20px}.crm-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 20px;background:#0f172a;color:white;border:1px solid #334155;border-radius:10px;box-shadow:0 5px 20px #0f172a30;z-index:1000;max-width:90vw;font-size:13px}.crm-toast-error{background:#9f1239}.crm-dashboard-cell{font-size:11px;min-width:160px;max-width:205px;line-height:1.6}.crm-detail-inline{border:1px solid #dbeafe;background:#eff6ff;border-radius:10px;padding:13px 16px;font-size:12px;color:#475569;margin:12px 0}.crm-detail-inline p{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px}.crm-data-note-global{margin-bottom:18px}.crm-mobile-header{display:none}.crm-nav-count{background:#f59e0b;color:#0f172a;font-size:10px;border-radius:20px;min-width:18px;text-align:center;line-height:18px}.crm-nav-count:empty{display:none}
+    @media(max-width:1000px){body>div.flex.h-screen>aside{width:220px}main{padding:18px!important}.crm-stats{gap:10px}.crm-stat{padding:16px}.crm-panel-head,.crm-toolbar{padding-left:18px;padding-right:18px}}
+    @media(max-width:760px){body>div.flex.h-screen{height:auto;min-height:100vh;display:block;overflow:visible}body>div.flex.h-screen>aside{width:100%;position:relative;max-height:none;display:block}body>div.flex.h-screen>aside>div:first-child>div:first-child{padding:14px 18px}body>div.flex.h-screen>aside nav{display:flex;overflow-x:auto;gap:4px;padding:8px 12px;white-space:nowrap}body>div.flex.h-screen>aside nav button{width:auto;flex-shrink:0;font-size:11px;padding:9px 11px}body>div.flex.h-screen>aside nav button i{display:none}body>div.flex.h-screen>aside>div:last-child{display:none}body>div.flex.h-screen>main{overflow:visible;padding:16px!important}.crm-stats{grid-template-columns:1fr 1fr}.crm-page-head{align-items:flex-start;flex-direction:column}.crm-page-title{font-size:21px}.crm-data-note{align-items:flex-start;flex-direction:column;gap:7px}.crm-panel-head{flex-direction:column}.crm-toolbar{gap:8px}.crm-toolbar .crm-input{min-width:100%;max-width:none}.crm-count{margin-left:0}.crm-grid{grid-template-columns:1fr}.crm-field-full{grid-column:auto}.crm-dialog-head{padding:18px 20px 16px}.crm-form-body{padding:18px 20px}.crm-history{padding:0 20px 18px}.crm-dialog-footer{padding:13px 20px;flex-wrap:wrap}.crm-dialog-title{font-size:18px}.crm-history-head{gap:6px}.crm-table{min-width:1000px}.crm-toast{bottom:16px;font-size:12px;width:90vw;text-align:center}#tab-students>div.grid{grid-template-columns:1fr}#tab-dashboard>.flex:first-child{flex-direction:column;align-items:flex-start;gap:15px}#tab-dashboard>.flex:first-child>div:last-child{flex-wrap:wrap}#tab-dashboard .grid.lg\:grid-cols-6{grid-template-columns:repeat(2,minmax(0,1fr))}#tab-dashboard .p-4.border-b>.flex{flex-wrap:wrap}#tab-dashboard .p-4.border-b>.flex input{width:100%}}
+    .crm-field[hidden],.crm-btn[hidden],.crm-convert-note[hidden],.crm-toast[hidden]{display:none!important}
+    @media print{.crm-data-note,.crm-dialog,.crm-toast{display:none!important}}
+  `; document.head.appendChild(style);
+  document.getElementById('nav-students').insertAdjacentHTML('afterend','<button onclick="switchTab(\'prospects\')" id="nav-prospects" class="w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-slate-300 hover:bg-slate-800 transition-all"><span class="flex items-center gap-3"><i data-lucide="user-round-plus" class="w-4 h-4"></i> 预备学员 · 招生跟进</span><span id="crm-prospect-nav-count" class="crm-nav-count"></span></button>');
+  document.querySelector('main').insertAdjacentHTML('afterbegin','<div class="crm-data-note crm-data-note-global"><span><strong>数据保存在当前浏览器</strong> · 换设备、换浏览器或清除浏览数据不会自动同步。请定期备份。</span><button class="crm-btn" type="button" onclick="exportAllDataBackup()">备份全部数据</button></div>');
+  document.getElementById('tab-students').insertAdjacentHTML('afterbegin',`<div class="crm-panel"><div class="crm-panel-head"><div><h2>学员维护</h2><p class="crm-subtitle">了解每位学员，及时沟通，持续跟进续费与学习需求。</p></div><div class="crm-inline"><span class="crm-badge" style="background:#fffbeb;color:#b45309" id="crm-student-due-count">0 人待跟进</span><button type="button" class="crm-btn" onclick="exportDashboardToExcel()">导出学员与跟进</button></div></div><div class="crm-toolbar"><input class="crm-input" id="crm-student-search" aria-label="搜索正式学员档案" placeholder="搜索姓名、电话、画像或备注…" oninput="renderCRMViews()"><select class="crm-select" id="crm-student-intent" aria-label="筛选学员续费意向" onchange="renderCRMViews()"><option value="">全部续费意向</option><option>高</option><option>中</option><option>低</option><option>未评估</option></select><label class="crm-checkbox"><input type="checkbox" id="crm-student-due" onchange="renderCRMViews()">仅看待跟进</label><span class="crm-count" id="crm-student-count"></span></div><div class="crm-table-wrap"><table class="crm-table"><thead><tr><th>学员 / 联系方式</th><th>续费意向</th><th>学员画像</th><th>自定义备注</th><th>最近跟进</th><th>下次跟进</th><th>操作</th></tr></thead><tbody id="crm-student-tbody"></tbody></table></div></div>`);
+  const newStuButton=document.querySelector('[onclick="createNewStudent()"]');
+  newStuButton.insertAdjacentHTML('beforebegin',`<div><label class="block font-medium text-slate-700 mb-1" for="new-stu-renewal">续费意向</label><select id="new-stu-renewal" class="w-full border border-slate-300 rounded-lg p-2.5 bg-white"><option>未评估</option><option>高</option><option>中</option><option>低</option></select></div><div><label class="block font-medium text-slate-700 mb-1" for="new-stu-profile">学员画像</label><textarea id="new-stu-profile" rows="3" placeholder="学习基础、目标、薄弱科目、沟通特点…" class="w-full border border-slate-300 rounded-lg p-2.5 bg-white"></textarea></div><div><label class="block font-medium text-slate-700 mb-1" for="new-stu-remarks">自定义备注</label><textarea id="new-stu-remarks" rows="2" placeholder="需要关注或处理的事项…" class="w-full border border-slate-300 rounded-lg p-2.5 bg-white"></textarea></div>`);
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section id="tab-prospects" class="hidden"><div class="crm-page-head"><div><h2 class="crm-page-title">预备学员 · 招生跟进</h2><p class="crm-subtitle">把每次意向沟通变成清晰的下一步。报名后转入正式学员管理。</p></div><div class="crm-inline"><button class="crm-btn" type="button" onclick="crmDownloadProspects()">导出招生与跟进</button><button class="crm-btn crm-btn-primary" type="button" onclick="crmOpenRecord('prospect')">＋ 新增预备学员</button></div></div><div class="crm-stats"><div class="crm-stat crm-stat-accent"><span>招生跟进中</span><strong id="crm-prospect-total">0</strong><small>尚未转正式，仍有报名机会</small></div><div class="crm-stat"><span>高报名意向</span><strong id="crm-prospect-high">0</strong><small>优先沟通课程与报名安排</small></div><div class="crm-stat crm-stat-due"><span>今天及逾期待跟进</span><strong id="crm-prospect-due-count">0</strong><small>计划到期，及时沟通</small></div><div class="crm-stat"><span>已转正式学员</span><strong id="crm-prospect-converted">0</strong><small>画像与历史完整保留</small></div></div><div class="crm-panel"><div class="crm-panel-head"><div><h3>招生名单</h3><p class="crm-subtitle">预备学员不计入正式学员数、购买课时和课消统计。</p></div></div><div class="crm-toolbar"><input class="crm-input" id="crm-prospect-search" aria-label="搜索预备学员" placeholder="搜索姓名、电话、课程、画像或备注…" oninput="renderCRMViews()"><select class="crm-select" id="crm-prospect-intent" aria-label="筛选报名意向" onchange="renderCRMViews()"><option value="">全部报名意向</option><option>高</option><option>中</option><option>低</option><option>未评估</option></select><select class="crm-select" id="crm-prospect-status" aria-label="筛选跟进状态" onchange="renderCRMViews()"><option value="">全部跟进状态</option><option>待联系</option><option>跟进中</option><option>已报名</option><option>暂不报名</option></select><label class="crm-checkbox"><input type="checkbox" id="crm-prospect-due" onchange="renderCRMViews()">仅看待跟进</label><span id="crm-prospect-count" class="crm-count"></span></div><div class="crm-table-wrap"><table class="crm-table"><thead><tr><th>姓名 / 联系方式</th><th>意向课程 / 画像</th><th>报名意向</th><th>跟进状态</th><th>备注 / 最近跟进</th><th>下次跟进</th><th>操作</th></tr></thead><tbody id="crm-prospect-tbody"></tbody></table></div></div></section>`);
+  document.body.insertAdjacentHTML('beforeend',`<div id="crm-toast" class="crm-toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="crm-record-dialog" class="crm-dialog" aria-labelledby="crm-record-title"><div class="crm-dialog-head"><div><h2 class="crm-dialog-title" id="crm-record-title"></h2><p class="crm-dialog-subtitle" id="crm-record-subtitle"></p></div><button class="crm-close" aria-label="关闭档案" onclick="crmCloseDialog('crm-record-dialog')">×</button></div><form id="crm-record-form"><div class="crm-form-body"><div id="crm-record-linked" class="crm-convert-note" hidden>该预备学员已转为正式学员。报名时的历史保留在这里，后续学习与续费请维护正式档案。</div><div class="crm-grid"><div class="crm-field"><label for="crm-record-name">姓名 *</label><input id="crm-record-name" required maxlength="100"></div><div class="crm-field"><label for="crm-record-phone">联系电话</label><input id="crm-record-phone" type="tel" maxlength="60" placeholder="选填，可填写家长联系方式"></div><div class="crm-field"><label for="crm-record-course">课程 / 意向科目</label><input id="crm-record-course" maxlength="200" placeholder="如：英语一对一、数学辅导"></div><div class="crm-field"><label id="crm-record-intent-label" for="crm-record-intent">续费意向</label><select id="crm-record-intent"><option>未评估</option><option>高</option><option>中</option><option>低</option></select></div><div class="crm-field" id="crm-record-status-wrap"><label for="crm-record-status">跟进状态</label><select id="crm-record-status"><option>待联系</option><option>跟进中</option><option>已报名</option><option>暂不报名</option></select></div><div class="crm-field"><label for="crm-record-next">下次跟进日期</label><input id="crm-record-next" type="date"><span class="crm-field-hint">到期仍待跟进时会突出提示。历史中的未完成计划也会提醒。</span></div><div class="crm-field crm-field-full"><label for="crm-record-profile">学员画像</label><textarea id="crm-record-profile" rows="3" placeholder="学习基础、目标院校或分数、薄弱科目、学习习惯、沟通特点、关注事项…"></textarea></div><div class="crm-field crm-field-full"><label for="crm-record-remarks">自定义备注事宜</label><textarea id="crm-record-remarks" rows="3" placeholder="需要关注或处理的事项，可随时修改…"></textarea></div></div><p class="crm-error" id="crm-record-error" role="alert"></p></div><div class="crm-history"><div class="crm-history-heading"><div><h3>跟进历史 <span class="crm-muted" id="crm-history-count"></span></h3><p class="crm-history-help" id="crm-record-history-help"></p></div><button type="button" id="crm-record-add-follow" class="crm-btn crm-btn-soft">＋ 添加跟进</button></div><div id="crm-record-history"></div></div><div class="crm-dialog-footer"><div class="crm-inline"><button type="button" id="crm-record-delete" class="crm-btn crm-btn-danger-link">删除预备学员</button><button type="button" id="crm-record-convert" class="crm-btn crm-btn-soft">转为正式学员</button></div><div class="crm-inline"><button type="button" class="crm-btn" onclick="crmCloseDialog('crm-record-dialog')">取消</button><button type="submit" class="crm-btn crm-btn-primary">保存档案</button></div></div></form></dialog>
+  <dialog id="crm-follow-dialog" class="crm-dialog crm-dialog-small" aria-labelledby="crm-follow-title"><div class="crm-dialog-head"><div><h2 class="crm-dialog-title" id="crm-follow-title"></h2><p class="crm-dialog-subtitle">记录具体动作、反馈与下一步安排。</p></div><button class="crm-close" aria-label="关闭跟进表单" onclick="crmCloseDialog('crm-follow-dialog')">×</button></div><form id="crm-follow-form"><div class="crm-form-body"><div class="crm-grid"><div class="crm-field"><label for="crm-follow-time">跟进时间 *</label><input id="crm-follow-time" type="datetime-local" required></div><div class="crm-field"><label for="crm-follow-method">跟进方式</label><select id="crm-follow-method"><option>微信</option><option>电话</option><option>面谈</option><option>其他</option></select></div><div class="crm-field crm-field-full"><label for="crm-follow-action">跟进动作描述 *</label><textarea id="crm-follow-action" required rows="3" placeholder="具体做了什么，如：联系家长沟通学习进度，发送续费方案…"></textarea></div><div class="crm-field crm-field-full"><label for="crm-follow-result">反馈或结果</label><textarea id="crm-follow-result" rows="2" placeholder="学员或家长的反馈，沟通结果…"></textarea></div><div class="crm-field crm-field-full"><label for="crm-follow-plan">下一步计划</label><textarea id="crm-follow-plan" rows="2" placeholder="如：周五再次电话确认试听时间"></textarea></div><div class="crm-field"><label for="crm-follow-next">下次跟进日期</label><input id="crm-follow-next" type="date"></div><div class="crm-field" style="justify-content:center"><label class="crm-checkbox" style="display:flex;flex-direction:row;align-items:center"><input style="width:auto" id="crm-follow-completed" type="checkbox">下一步计划已完成</label></div></div><p id="crm-follow-error" class="crm-error" role="alert"></p></div><div class="crm-dialog-footer"><span class="crm-muted">保存后加入历史时间线</span><div class="crm-inline"><button type="button" class="crm-btn" onclick="crmCloseDialog('crm-follow-dialog')">取消</button><button type="submit" class="crm-btn crm-btn-primary">保存跟进</button></div></div></form></dialog>
+  <dialog id="crm-convert-dialog" class="crm-dialog crm-dialog-small" aria-labelledby="crm-convert-title"><div class="crm-dialog-head"><div><h2 class="crm-dialog-title" id="crm-convert-title">转为正式学员</h2><p class="crm-dialog-subtitle"><strong id="crm-convert-name"></strong> · 补充报名课包信息</p></div><button class="crm-close" aria-label="关闭转正式表单" onclick="crmCloseDialog('crm-convert-dialog')">×</button></div><form id="crm-convert-form"><div class="crm-form-body"><div class="crm-convert-note">画像、联系方式、备注和全部跟进历史将保留。正式档案的续费意向从“未评估”开始，报名意向仍保存在预备学员档案。</div><div class="crm-grid"><div class="crm-field crm-field-full"><label for="crm-convert-course">课程类型 *</label><input id="crm-convert-course" required list="crm-course-options"><datalist id="crm-course-options"><option value="专升本专业课一对一"><option value="专升本公共课一对一"><option value="雅思托福一对一"></datalist></div><div class="crm-field"><label for="crm-convert-hours">购买课时 *</label><input id="crm-convert-hours" type="number" min="0.1" step="0.1" required placeholder="如：40"></div><div class="crm-field"><label for="crm-convert-teacher">负责 / 主讲教师</label><input id="crm-convert-teacher" list="global-teachers-datalist" placeholder="可手写，未填为待分配"></div></div><p id="crm-convert-error" class="crm-error" role="alert"></p></div><div class="crm-dialog-footer"><span class="crm-muted">报名后计入正式课包统计</span><div class="crm-inline"><button type="button" class="crm-btn" onclick="crmCloseDialog('crm-convert-dialog')">取消</button><button type="submit" id="crm-convert-submit" class="crm-btn crm-btn-primary">确认报名并建档</button></div></div></form></dialog>`);
+  const giftStyle=document.createElement('style');giftStyle.textContent='.crm-gift{background:#faf5ff;color:#7e22ce;border:1px solid #e9d5ff}.crm-gift-choice{background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;padding:12px 14px;display:flex;gap:10px;align-items:center;color:#6b21a8;font-size:13px}.crm-gift-choice input{width:16px!important;height:16px;accent-color:#9333ea}.crm-gift-choice small{display:block;color:#64748b;font-size:11px;margin-top:3px}';document.head.appendChild(giftStyle);
+  document.getElementById('crm-student-intent').insertAdjacentHTML('afterend','<select class="crm-select" id="crm-student-gift" aria-label="筛选学员标签" onchange="renderCRMViews()"><option value="">全部学员标签</option><option value="gift">赠送学员</option><option value="normal">普通学员</option></select>');
+  document.getElementById('crm-record-profile').closest('.crm-field').insertAdjacentHTML('beforebegin','<div class="crm-field crm-field-full"><label class="crm-gift-choice" for="crm-record-is-gift"><input id="crm-record-is-gift" type="checkbox"><span>赠送学员<small>用于分类标记，排课与消课照常扣减课时。</small></span></label></div>');
+  newStuButton.insertAdjacentHTML('beforebegin','<label class="crm-gift-choice" for="new-stu-is-gift"><input id="new-stu-is-gift" type="checkbox"><span>赠送学员<small>档案和报表显示“赠送”，消课照常扣减课时。</small></span></label>');
+  document.getElementById('crm-record-form').addEventListener('submit',crmSaveRecord);
+  document.getElementById('crm-follow-form').addEventListener('submit',crmSaveFollowup);
+  document.getElementById('crm-convert-form').addEventListener('submit',crmConvert);
+  document.getElementById('crm-record-add-follow').onclick=()=>{if(crmEditing&&!crmEditing.fresh)crmOpenFollowup(crmEditing.type,crmEditing.id);};
+  document.getElementById('crm-record-delete').onclick=()=>{if(crmEditing)crmDeleteProspect(crmEditing.id);};
+  document.getElementById('crm-record-convert').onclick=()=>{if(crmEditing && document.getElementById('crm-record-form').reportValidity() && crmSaveRecord({preventDefault(){}},false))crmOpenConvert(crmEditing.id);};
+  document.addEventListener('click',event=>{
+    const button=event.target.closest('[data-crm-action]'); if (!button) return;
+    const {crmAction:action,crmType:type,crmId:id,crmFollowId:followId}=button.dataset;
+    if(action==='new')crmOpenRecord('prospect');
+    if(action==='open')crmOpenRecord(type,id);
+    if(action==='follow')crmOpenFollowup(type,id);
+    if(action==='convert')crmOpenConvert(id);
+    if(action==='converted'){const p=crmFind('prospect',id);if(p)crmOpenRecord('student',p.convertedStudentId);}
+    if(action==='edit-follow')crmOpenFollowup(type,id,followId);
+    if(action==='delete-follow')crmDeleteFollowup(type,id,followId);
+    if(action==='toggle-follow')crmToggleFollowup(type,id,followId);
+  });
+}
+
+crmInstallUI();
+students.forEach(s=>normalizeCRMRecord(s)); prospects.forEach(p=>normalizeCRMRecord(p,'prospect'));
+const crmOriginalPersist=persist;
+persist=function(){students.forEach(s=>normalizeCRMRecord(s));prospects.forEach(p=>normalizeCRMRecord(p,'prospect'));try{localStorage.setItem('xdf_prospects',JSON.stringify(prospects));crmOriginalPersist();}catch(error){crmToast('保存失败：浏览器空间不足或存储不可用，请立即备份数据。',true);throw error;}};
+const crmOriginalUpdateAllViews=updateAllViews;
+updateAllViews=function(){crmOriginalUpdateAllViews();renderCRMViews();};
+const crmOriginalSwitchTab=switchTab;
+switchTab=function(tabId){crmOriginalSwitchTab(tabId);const section=document.getElementById('tab-prospects');const nav=document.getElementById('nav-prospects');section.classList.toggle('hidden',tabId!=='prospects');nav.classList.toggle('bg-blue-600',tabId==='prospects');nav.classList.toggle('text-white',tabId==='prospects');nav.classList.toggle('text-slate-300',tabId!=='prospects');nav.classList.toggle('hover:bg-slate-800',tabId!=='prospects');if(tabId==='prospects'||tabId==='students')renderCRMViews();};
+const crmOriginalShowStudentDetail=showStudentDetailModal;
+showStudentDetailModal=function(studentId){crmOriginalShowStudentDetail(studentId);const s=crmFind('student',studentId);if(!s)return;document.getElementById('crm-detail-inline')?.remove();const anchor=document.getElementById('stu-detail-unscheduled-banner');if(anchor)anchor.insertAdjacentHTML('beforebegin',`<div class="crm-detail-inline" id="crm-detail-inline"><div class="crm-inline"><strong>学员维护</strong>${crmGiftBadge(s)}${crmIntentBadge(s.renewalIntent)}${crmButton('open','student',s.id,'画像 / 备注 / 跟进','crm-btn-link')}</div><p><b>画像：</b>${crmEsc(s.profile || '待完善')}</p><p><b>备注：</b>${crmEsc(s.remarks || '未填写')}</p><div style="margin-top:8px">下次跟进：${crmFollowDateCell(s,'student')}</div></div>`);};
+const crmOriginalCreateNewStudent=createNewStudent;
+createNewStudent=function(){const count=students.length;crmOriginalCreateNewStudent();if(students.length>count){document.getElementById('new-stu-profile').value='';document.getElementById('new-stu-remarks').value='';document.getElementById('new-stu-renewal').value='未评估';document.getElementById('new-stu-is-gift').checked=false;}};
+renderCRMViews();

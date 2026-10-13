@@ -1,0 +1,169 @@
+/* Data migrations, imports, and portable backups for the browser-local app. */
+function appBackupData() {
+  return { schemaVersion: 4, exportedAt: new Date().toISOString(), students, records, schedules, teachers,
+    appointments, prospects: typeof prospects === 'undefined' ? [] : prospects, dingTalkConfig, bizConfig,
+    erpSync: typeof erpGetSyncState === 'function' ? erpGetSyncState() : null };
+}
+function appDownloadJSON(data, filename) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type:'application/json;charset=utf-8'}));
+  const link = document.createElement('a'); link.href = url; link.download = filename; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+exportAllDataBackup = function() { appDownloadJSON(appBackupData(), `XDF_完整数据备份_${appLocalDate()}.json`); };
+function appLocalDate() { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+function appWriteBackupSafetyCopy() {
+  localStorage.setItem('xdf_before_import_backup', JSON.stringify(appBackupData()));
+}
+function appSafeRestoreSnapshot(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.students)) throw new Error('文件缺少学员名单，请选择本系统导出的 JSON 备份。');
+  for (const key of ['students','records','schedules','teachers','appointments','prospects']) {
+    if (data[key] !== undefined && !Array.isArray(data[key])) throw new Error(`${key} 数据格式错误。`);
+    if (data[key]?.some(x => !x || typeof x !== 'object' || Array.isArray(x))) throw new Error(`${key} 中包含无效记录。`);
+  }
+  const next = structuredClone(data);
+  const ids = new Set(), names = new Set();
+  next.students.forEach(s => {
+    s.name = String(s.name || '').trim();
+    s.id = Number(s.id);
+    if (!s.name || !Number.isSafeInteger(s.id) || ids.has(s.id) || names.has(s.name)) throw new Error('学员姓名或编号为空/重复，请先检查备份。');
+    ids.add(s.id); names.add(s.name);
+    ['totalHours','consumedHours'].forEach(key => { s[key]=Number(s[key]||0); if(!Number.isFinite(s[key]) || s[key]<0) throw new Error('备份中有无效课时。'); });
+    if (s.hoursLedger) XdfHoursLedger.validate(s.hoursLedger);
+    if (s.consumedHours > s.totalHours) throw new Error('备份中已消课时超过购买课时。');
+    if (typeof normalizeCRMRecord === 'function') normalizeCRMRecord(s,'student');
+  });
+  const prospectIds = new Set();
+  (next.prospects || []).forEach(p => {
+    if (!String(p.name||'').trim() || !String(p.id||'').trim() || prospectIds.has(String(p.id))) throw new Error('预备学员姓名或编号无效/重复。');
+    prospectIds.add(String(p.id));
+    if (typeof normalizeCRMRecord === 'function') normalizeCRMRecord(p,'prospect');
+  });
+  return next;
+}
+async function appRestoreBackup(event) {
+  const file=event.target.files?.[0]; if(!file) return;
+  try {
+    const next=appSafeRestoreSnapshot(JSON.parse(await file.text()));
+    if(!confirm(`将恢复 ${next.students.length} 位正式学员、${(next.prospects||[]).length} 位预备学员及相关记录，替换此浏览器当前数据。是否继续？`)) return;
+    appWriteBackupSafetyCopy();
+    const prior=appBackupData();
+    try {
+      students=next.students; records=next.records||[]; schedules=next.schedules||[];
+      teachers=next.teachers||[]; appointments=next.appointments||[]; prospects=next.prospects||[];
+      bizConfig=next.bizConfig||bizConfig;
+      dingTalkConfig={...(next.dingTalkConfig||dingTalkConfig),dailyTimerEnable:false};
+      persist();
+      if (typeof erpRestoreSyncState === 'function') erpRestoreSyncState(next.erpSync || null);
+    } catch(error) {
+      students=prior.students; records=prior.records; schedules=prior.schedules; teachers=prior.teachers;
+      appointments=prior.appointments; prospects=prior.prospects; bizConfig=prior.bizConfig; dingTalkConfig=prior.dingTalkConfig;
+      if (typeof erpRestoreSyncState === 'function') { try { erpRestoreSyncState(prior.erpSync || null); } catch {} }
+      try { persist(); } catch {}
+      throw error;
+    }
+    if(typeof crmToast==='function') crmToast('备份已恢复。定时推送已关闭，可在设置中重新开启。');
+    else alert('备份恢复成功');
+  } catch(error) { alert('恢复失败：'+error.message); }
+  finally { event.target.value=''; }
+}
+function appMergeImportedRows(rows) {
+  const imported=new Map();
+  for(const row of rows) {
+    const name=String(row['学员姓名']||row['学生姓名']||row['姓名']||'').trim(); if(!name) continue;
+    const course=String(row['课程类型']||row['集团产品分类']||row['产品名称']||'专升本一对一').trim();
+    const teacher=String(row['负责老师']||row['任课老师']||row['任课教师']||row['意向科目']||'待分配').trim();
+    const totalHours=Number(row['总课时']??row['课时数']??row['购买课时']??0);
+    const consumedHours=Number(row['已排已上']??row['已消课时']??row['已派已上']??0);
+    if(!Number.isFinite(totalHours)||totalHours<0||!Number.isFinite(consumedHours)||consumedHours<0||consumedHours>totalHours) throw new Error(`${name} 的课时无效，购买/已消课时需为非负数，已消不能超过购买。`);
+    let sch=row['已排未上']!==undefined?consumedHours+Number(row['已排未上']):(row['已派']??row['已排']??row['已排课时']); const unsch=row['未排待排']??row['未排']??row['未排课时'];
+    if(sch===undefined&&unsch!==undefined)sch=totalHours-Number(unsch);
+    if([sch,unsch].some(v=>v!==undefined && (!Number.isFinite(Number(v))||Number(v)<0))) throw new Error(`${name} 的排课课时无效。`);
+    const item={name,course,teacher,totalHours,consumedHours,phone:String(row['联系电话']||row['电话']||'').trim()};
+    const giftValue=row['学员标签']??row['是否赠送']??row['赠送'];
+    if(giftValue!==undefined && String(giftValue).trim()!=='') {
+      const tag=String(giftValue).trim().toLowerCase();
+      if(!['赠送','是','true','1','普通','否','false','0','无'].includes(tag)) throw new Error(`${name} 的学员标签无法识别，请填写“赠送”或“普通”。`);
+      item.isGift=['赠送','是','true','1'].includes(tag);
+    }
+    if(sch!==undefined && (Number(sch)<consumedHours || Number(sch)>totalHours)) throw new Error(`${name} 的已排课时必须介于已上与总课时之间。`);
+    if(unsch!==undefined && sch!==undefined && Math.abs(totalHours-Number(sch)-Number(unsch))>0.0001) throw new Error(`${name} 的三类课时之和必须等于总课时。`);
+    if(sch!==undefined) item.scheduledHours=Number(sch);
+    if(unsch!==undefined) item.unscheduledHours=Number(unsch);
+    if(!imported.has(name)) imported.set(name,item);
+    else {
+      const target=imported.get(name); target.totalHours+=totalHours; target.consumedHours+=consumedHours;
+      if(sch!==undefined) target.scheduledHours=(target.scheduledHours||0)+Number(sch);
+      if(unsch!==undefined) target.unscheduledHours=(target.unscheduledHours||0)+Number(unsch);
+      if(!target.course.split('、').includes(course)) target.course+='、'+course;
+      if(teacher!=='待分配'&&!target.teacher.split('、').includes(teacher)) target.teacher=target.teacher==='待分配'?teacher:target.teacher+'、'+teacher;
+      if(item.phone) target.phone=item.phone;
+      if(item.isGift!==undefined) target.isGift=item.isGift;
+    }
+  }
+  if(!imported.size) throw new Error('未识别到学员姓名，请使用本系统提供的模板。');
+  const merged=structuredClone(students), oldMap=new Map(merged.map(s=>[String(s.name).trim(),s]));
+  let added=0,updated=0,nextId=Math.max(Date.now(),...merged.map(s=>Number(s.id)||0));
+  for(const [name,row] of imported) {
+    if(oldMap.has(name)) {
+      const old=oldMap.get(name), phone=row.phone||old.phone||'';
+      Object.assign(old,row,{phone});
+      // Omitted schedule totals must be recalculated from preserved schedules.
+      if(row.scheduledHours===undefined) delete old.scheduledHours;
+      if(row.unscheduledHours===undefined) delete old.unscheduledHours;
+      updated++;
+    } else { const n={...row,id:++nextId}; if(typeof normalizeCRMRecord==='function')normalizeCRMRecord(n,'student'); merged.push(n); added++; }
+  }
+  if(typeof hoursRebaseImported==='function') hoursRebaseImported(merged,'Excel 报表',new Set(imported.keys()));
+  return {students:merged,added,updated};
+}
+handleExcelImport = async function(event) {
+  const file=event.target.files?.[0]; if(!file)return;
+  try {
+    if(!window.XLSX)throw new Error('Excel 组件尚未加载，请检查网络后重试。');
+    const wb=XLSX.read(new Uint8Array(await file.arrayBuffer()),{type:'array'});
+    const result=appMergeImportedRows(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]));
+    if(!confirm(`识别到 ${result.updated} 位已有学员、${result.added} 位新学员。文件中的累计余额将设为新老账，原新账归档，排课与流水保留且不会重复计入；文件外学员保留。继续导入？`))return;
+    appWriteBackupSafetyCopy(); students=result.students; persist();
+    alert(`导入成功：更新 ${result.updated} 位，新增 ${result.added} 位。维护信息和历史记录已保留。`);
+  } catch(error){ alert('导入失败：'+error.message); }
+  finally {event.target.value='';}
+};
+function appCRMExportFields(s,type='student') {
+  const last=[...(s.followUps||[])].sort((a,b)=>String(b.time).localeCompare(String(a.time)))[0];
+  return {'学员标签':s.isGift===true?'赠送':'普通','学员画像':s.profile||'', [type==='student'?'续费意向':'报名意向']:s[type==='student'?'renewalIntent':'enrollmentIntent']||'未评估',
+    '备注事项':s.remarks||'', '最近跟进时间':last?.time||'', '最近跟进动作':last?.action||'', '下次跟进日期':typeof crmNextDate==='function'?crmNextDate(s):(s.nextFollowupAt||'')};
+}
+function appAppendFollowups(wb,items,type) {
+  const rows=items.flatMap(s=>(s.followUps||[]).map(f=>({'学员姓名':s.name,'类别':type,'跟进时间':f.time,'跟进方式':f.method,'跟进动作':f.action,'反馈结果':f.result||'','下一步计划':f.nextPlan||'','下次跟进日期':f.nextDate||'','已完成':f.completed?'是':'否'})));
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows.length?rows:[{'说明':'暂无跟进记录'}]),'跟进明细');
+}
+exportDashboardToExcel = function() {
+  if(!window.XLSX){alert('Excel 组件尚未加载，请稍后重试。');return;}
+  const data=students.map(s=>{
+    const remain=Number(s.totalHours||0)-Number(s.consumedHours||0);
+    const pending=schedules.filter(sc=>(sc.studentId===s.id||sc.studentName===s.name)&&!sc.consumed).reduce((sum,sc)=>sum+Number(sc.hours||0),0);
+    return {'学员姓名':s.name,'课程类型':s.course,'负责老师':s.teacher,'总课时':s.totalHours,'已消课时':s.consumedHours,'剩余未消课时':remain,
+      '已排课时':s.scheduledHours,'未排课时':s.unscheduledHours,'已排已上':hoursView(s).current.taught,'已排未上':hoursView(s).current.pending,'未排待排':hoursView(s).current.unscheduled,
+      '老账已排已上':hoursView(s).baseline.taught,'老账已排未上':hoursView(s).baseline.pending,'老账未排待排':hoursView(s).baseline.unscheduled,
+      '新账已排已上净变动':hoursView(s).delta.taught,'新账已排未上净变动':hoursView(s).delta.pending,'新账未排待排净变动':hoursView(s).delta.unscheduled,'联系电话':s.phone||'',...appCRMExportFields(s)};
+  });
+  const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(data),'正式学员');
+  appAppendFollowups(wb,students,'正式学员'); XLSX.writeFile(wb,`XDF_学员及跟进_${appLocalDate()}.xlsx`);
+};
+function appExportProspects() {
+  if(!window.XLSX){alert('Excel 组件尚未加载，请稍后重试。');return;}
+  const wb=XLSX.utils.book_new();
+  const rows=prospects.map(p=>({'学员姓名':p.name,'联系电话':p.phone||'','意向课程':p.course||'','跟进状态':p.status,'转入正式学员编号':p.convertedStudentId||'',...appCRMExportFields(p,'prospect')}));
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows.length?rows:[{'说明':'暂无预备学员'}]),'预备学员');
+  appAppendFollowups(wb,prospects,'预备学员'); XLSX.writeFile(wb,`XDF_预备学员及跟进_${appLocalDate()}.xlsx`);
+}
+function appInstallDataTools() {
+  const footer=document.querySelector('aside > div:last-child');
+  if(footer) footer.insertAdjacentHTML('beforeend',`<input id="restore-backup-file" type="file" accept="application/json,.json" hidden onchange="appRestoreBackup(event)">
+    <button type="button" onclick="document.getElementById('restore-backup-file').click()" class="mt-2 w-full rounded border border-slate-600 py-2 text-slate-200 hover:bg-slate-800">恢复 JSON 备份</button>
+    <button type="button" onclick="appDownloadSafetyCopy()" class="mt-1 w-full py-1 text-slate-400 hover:text-white">下载导入前自动备份</button>`);
+  const banner=document.querySelector('.crm-data-note-global');
+  if(banner) banner.insertAdjacentHTML('beforeend','<button class="crm-btn" type="button" onclick="document.getElementById(\'restore-backup-file\').click()">恢复旧版 / JSON 备份</button>');
+}
+function appDownloadSafetyCopy(){ const raw=localStorage.getItem('xdf_before_import_backup'); if(!raw){alert('尚无导入前自动备份。');return;} appDownloadJSON(JSON.parse(raw),'XDF_导入前备份.json'); }
+appInstallDataTools();

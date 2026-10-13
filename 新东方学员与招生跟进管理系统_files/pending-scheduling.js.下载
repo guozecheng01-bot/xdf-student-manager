@@ -1,0 +1,99 @@
+/* One backlog derived from appointments; scheduling removes a row automatically. */
+'use strict';
+let pendingSchedulingEditingId = null;
+function getPendingSchedulingRows() {
+  return appointments.filter(a=>a.status!=='已取消'&&!appointmentHasSchedule(a)).map(a=>{
+    const student=students.find(s=>String(s.id)===String(a.studentId));
+    const hours=Number(a.hours||0);
+    return {id:a.id,studentId:a.studentId,studentName:student?.name||a.studentName||'学员已删除',
+      course:String(a.course||student?.course||''),teacher:String(a.teacher||''),hours:Number.isFinite(hours)?hours:0,
+      date:String(a.date||''),timeRange:isAppointmentTimePending(a)?'':String(a.timeRange||''),status:String(a.status||'待确认'),
+      unscheduledReason:String(a.unscheduledReason||''),nextAction:String(a.nextAction||''),followupDate:crmDate(a.followupDate),isGift:student?.isGift===true};
+  }).sort((a,b)=>(a.followupDate||'9999').localeCompare(b.followupDate||'9999')||Number(b.id)-Number(a.id));
+}
+function renderPendingSchedulingViews() {
+  const tbody=document.getElementById('pending-scheduling-body');if(!tbody)return;
+  const rows=getPendingSchedulingRows(),today=crmToday();
+  document.getElementById('pending-total').textContent=rows.length;
+  document.getElementById('pending-hours').textContent=Number(rows.reduce((n,r)=>n+r.hours,0).toFixed(2));
+  document.getElementById('pending-reasons').textContent=rows.filter(r=>!r.unscheduledReason.trim()).length;
+  document.getElementById('pending-due').textContent=rows.filter(r=>r.followupDate&&r.followupDate<=today).length;
+  document.getElementById('pending-nav-count').textContent=rows.length||'';
+  const teacherSelect=document.getElementById('pending-teacher-filter'),selected=teacherSelect.value;
+  const teacherNames=[...new Set(rows.map(r=>r.teacher).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-CN'));
+  teacherSelect.innerHTML='<option value="">全部老师</option>'+teacherNames.map(t=>`<option value="${crmEsc(t)}">${crmEsc(t)}</option>`).join('');
+  teacherSelect.value=teacherNames.includes(selected)?selected:'';
+  const query=document.getElementById('pending-search').value.trim().toLowerCase(),filter=document.getElementById('pending-state-filter').value;
+  const visible=rows.filter(r=>(!query||[r.studentName,r.course,r.teacher,r.unscheduledReason,r.nextAction,r.isGift?'赠送':''].join(' ').toLowerCase().includes(query))&&(!teacherSelect.value||teacherSelect.value===r.teacher)&&
+    (!filter||(filter==='reason'&&!r.unscheduledReason.trim())||(filter==='due'&&r.followupDate&&r.followupDate<=today)||(filter==='gift'&&r.isGift)));
+  document.getElementById('pending-visible-count').textContent=`${visible.length} / ${rows.length} 单`;
+  tbody.innerHTML=visible.length?visible.map(r=>`<tr><td><strong>${crmEsc(r.studentName)}</strong> ${crmGiftBadge(r)}<small>${crmEsc(r.status)}</small></td><td>${crmEsc(r.course||'待补充')}</td><td>${crmEsc(r.teacher||'待分配')}</td><td>${r.hours} h</td><td class="pending-copy">${crmEsc(r.unscheduledReason||'尚未填写')}<small>${crmEsc(r.date||'日期待协商')} · ${crmEsc(r.timeRange||'时间待协商')}</small></td><td class="pending-copy">${crmEsc(r.nextAction||'待补充')}<small class="${r.followupDate&&r.followupDate<=today?'crm-due':''}">${crmEsc(r.followupDate||'未设置跟进日期')}${r.followupDate&&r.followupDate<=today?' · 待跟进':''}</small></td><td><div class="crm-table-actions"><button class="crm-btn crm-btn-link" type="button" data-pending-action="edit" data-id="${crmEsc(r.id)}">填写 / 编辑</button><button class="crm-btn crm-btn-soft" type="button" data-pending-action="schedule" data-id="${crmEsc(r.id)}">确认时间 / 排课</button><button class="crm-btn crm-btn-danger-link" type="button" data-pending-action="cancel" data-id="${crmEsc(r.id)}">取消预约</button></div></td></tr>`).join(''):'<tr><td colspan="7" class="crm-empty">暂无匹配的已预约未排课记录。可新增待排需求，或调整筛选条件。</td></tr>';
+}
+function openPendingSchedulingRecord(id) {
+  const ap=id==null?null:appointments.find(a=>String(a.id)===String(id));
+  if(id!=null&&!ap){crmToast('预约已不存在，请刷新列表。',true);return;}
+  if(ap&&(ap.status==='已取消'||appointmentHasSchedule(ap))){crmToast('该预约已取消或已排课，请查看预约记录。');return;}
+  pendingSchedulingEditingId=ap?.id??null;
+  document.getElementById('pending-editor-title').textContent=ap?'维护已预约未排课需求':'新增已预约未排课需求';
+  const select=document.getElementById('pending-student');
+  select.innerHTML='<option value="">请选择学员</option>'+students.map(s=>`<option value="${crmEsc(s.id)}">${crmEsc(s.name)}${s.isGift?'（赠送）':''} · ${crmEsc(s.course)}</option>`).join('');
+  if(ap&&!students.some(s=>String(s.id)===String(ap.studentId)))select.insertAdjacentHTML('beforeend',`<option value="${crmEsc(ap.studentId)}">${crmEsc(ap.studentName)}（原档案已删除）</option>`);
+  select.value=ap?String(ap.studentId):'';
+  const student=students.find(s=>String(s.id)===select.value);
+  document.getElementById('pending-course').value=ap?.course||student?.course||'';
+  document.getElementById('pending-teacher').value=ap?.teacher||'';
+  document.getElementById('pending-record-hours').value=ap?.hours||2;
+  document.getElementById('pending-reason').value=ap?.unscheduledReason||'';
+  document.getElementById('pending-next-action').value=ap?.nextAction||'';
+  document.getElementById('pending-followup-date').value=crmDate(ap?.followupDate);
+  document.getElementById('pending-editor-error').textContent='';
+  crmOpenDialog('pending-editor-dialog');
+}
+function pendingSchedulingChooseStudent() {
+  const s=students.find(s=>String(s.id)===document.getElementById('pending-student').value);if(!s)return;
+  document.getElementById('pending-course').value=s.course||'';
+  document.getElementById('pending-teacher').value=s.teacher==='待分配'?'':s.teacher||'';
+}
+function savePendingSchedulingRecord(event) {
+  event.preventDefault();
+  const old=pendingSchedulingEditingId==null?null:appointments.find(a=>String(a.id)===String(pendingSchedulingEditingId));
+  const studentId=Number(document.getElementById('pending-student').value),student=students.find(s=>s.id===studentId);
+  const course=document.getElementById('pending-course').value.trim(),teacher=document.getElementById('pending-teacher').value.trim(),hours=Number(document.getElementById('pending-record-hours').value);
+  const error=document.getElementById('pending-editor-error');
+  if(!student||!course||!teacher||!Number.isFinite(hours)||hours<=0){error.textContent='请选择有效学员，填写课程、老师和大于 0 的课时。';return;}
+  if(pendingSchedulingEditingId!=null&&(!old||old.status==='已取消'||appointmentHasSchedule(old))){error.textContent='预约状态已变化，请关闭后刷新列表。';return;}
+  const data={studentId,studentName:student.name,course,teacher,hours,unscheduledReason:document.getElementById('pending-reason').value.trim(),nextAction:document.getElementById('pending-next-action').value.trim(),followupDate:document.getElementById('pending-followup-date').value};
+  if(old)Object.assign(old,data);else appointments.unshift({id:Math.max(Date.now(),...appointments.map(a=>Number(a.id)||0))+1,...data,date:'',timeRange:'',timePending:true,status:'待老师确认时间',note:''});
+  if(!teachers.some(t=>t.name===teacher))teachers.push({id:Date.now(),name:teacher,subject:course,phone:''});
+  persist();document.getElementById('pending-editor-dialog').close();pendingSchedulingEditingId=null;crmToast('待排需求已保存，将同步到钉钉日报附页。');
+}
+function exportPendingSchedulingToExcel() {
+  if(!window.XLSX){alert('Excel 组件尚未加载，请稍后重试。');return;}
+  const rows=getPendingSchedulingRows().map(r=>({'学生姓名':r.studentName,'学员标签':r.isGift?'赠送':'普通','课程':r.course,'老师':r.teacher,'课时':r.hours,'未排/未约原因':r.unscheduledReason,'预约状态':r.status,'预约日期':r.date||'待协商','预约时间':r.timeRange||'待协商','后续安排':r.nextAction,'下次跟进日期':r.followupDate}));
+  const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows.length?rows:[{'说明':'暂无已预约未排课需求'}]),'已预约未排课');XLSX.writeFile(wb,`XDF_已预约未排课_${crmToday()}.xlsx`);
+}
+function installPendingSchedulingUI() {
+  const style=document.createElement('style');style.textContent='.pending-copy{white-space:pre-wrap;min-width:170px;max-width:280px;overflow-wrap:anywhere}#tab-unscheduled .crm-table{min-width:1100px}#pending-editor-dialog .crm-grid{gap:16px}';document.head.appendChild(style);
+  document.getElementById('nav-appointments').insertAdjacentHTML('afterend',`<button id="nav-unscheduled" type="button" onclick="switchTab('unscheduled')" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-300 hover:bg-slate-800 transition"><span>📋</span><span>已预约未排课</span><span id="pending-nav-count" class="ml-auto text-xs"></span></button>`);
+  document.querySelector('main').insertAdjacentHTML('beforeend',`<section id="tab-unscheduled" class="space-y-6 hidden"><div class="crm-page-head"><div><h2 class="crm-page-title">已预约未排课 · 跟进管理</h2><p class="crm-subtitle">已登记预约但尚未转入正式排课的需求。记录未排原因，明确下一步安排。</p></div><div class="crm-inline"><button class="crm-btn" type="button" onclick="exportPendingSchedulingToExcel()">导出清单</button><button class="crm-btn crm-btn-soft" type="button" onclick="switchTab('dingtalk')">查看钉钉日报附页</button><button class="crm-btn crm-btn-primary" type="button" onclick="openPendingSchedulingRecord()">＋ 新增待排需求</button></div></div><div class="crm-stats"><div class="crm-stat crm-stat-accent"><span>已预约未排课</span><strong id="pending-total">0</strong><small>预约已取消 / 已排课后自动移出</small></div><div class="crm-stat"><span>待排课时</span><strong id="pending-hours">0</strong><small>当前预约需求的预估总课时</small></div><div class="crm-stat"><span>原因待补充</span><strong id="pending-reasons">0</strong><small>补充原因，便于协调与日报汇总</small></div><div class="crm-stat crm-stat-due"><span>今天及逾期待跟进</span><strong id="pending-due">0</strong><small>及时联系老师或学员确认</small></div></div><div class="crm-panel"><div class="crm-panel-head"><div><h3>待排需求清单</h3><p class="crm-subtitle">与预约记录同步。日期未知时无需填写，确认后可转正式排课。</p></div></div><div class="crm-toolbar"><input id="pending-search" class="crm-input" placeholder="搜索学生、课程、老师或原因…" aria-label="搜索待排需求" oninput="renderPendingSchedulingViews()"><select id="pending-teacher-filter" class="crm-select" aria-label="筛选待排老师" onchange="renderPendingSchedulingViews()"><option value="">全部老师</option></select><select id="pending-state-filter" class="crm-select" aria-label="筛选待排情况" onchange="renderPendingSchedulingViews()"><option value="">全部情况</option><option value="reason">原因待补充</option><option value="due">今天及逾期待跟进</option><option value="gift">赠送学员</option></select><span id="pending-visible-count" class="crm-count"></span></div><div class="crm-table-wrap"><table class="crm-table"><thead><tr><th>学生姓名 / 预约状态</th><th>课程</th><th>老师</th><th>课时</th><th>未排 / 未约原因</th><th>后续安排 / 跟进日期</th><th>操作</th></tr></thead><tbody id="pending-scheduling-body"></tbody></table></div></div></section>`);
+  document.body.insertAdjacentHTML('beforeend',`<dialog id="pending-editor-dialog" class="crm-dialog crm-dialog-small" aria-labelledby="pending-editor-title"><div class="crm-dialog-head"><div><h2 id="pending-editor-title" class="crm-dialog-title">待排需求</h2><p class="crm-dialog-subtitle">先记录需求，日期和时间可在与老师协商后补充。</p></div><button class="crm-close" type="button" aria-label="关闭待排需求" onclick="document.getElementById('pending-editor-dialog').close()">×</button></div><form id="pending-editor-form"><div class="crm-form-body"><div class="crm-grid"><div class="crm-field crm-field-full"><label for="pending-student">学生姓名 *</label><select id="pending-student" required onchange="pendingSchedulingChooseStudent()"></select></div><div class="crm-field crm-field-full"><label for="pending-course">预约课程 *</label><input id="pending-course" required placeholder="如：高等数学专题"></div><div class="crm-field"><label for="pending-teacher">预约老师 *</label><input id="pending-teacher" required list="global-teachers-datalist" placeholder="可选择或手写老师"></div><div class="crm-field"><label for="pending-record-hours">预估课时（小时）*</label><input id="pending-record-hours" type="number" min="0.1" step="0.1" required></div><div class="crm-field crm-field-full"><label for="pending-reason">未排 / 未约原因</label><textarea id="pending-reason" rows="3" placeholder="如：老师档期未确认、学生时间未定、需更换老师…"></textarea></div><div class="crm-field crm-field-full"><label for="pending-next-action">后续安排 / 跟进动作</label><textarea id="pending-next-action" rows="3" placeholder="如：周五联系老师确认可用档期，再与学员沟通"></textarea></div><div class="crm-field"><label for="pending-followup-date">下次跟进日期</label><input id="pending-followup-date" type="date"></div></div><p id="pending-editor-error" class="crm-error" role="alert"></p></div><div class="crm-dialog-footer"><span class="crm-muted">保存后自动进入日报附页</span><div class="crm-inline"><button type="button" class="crm-btn" onclick="document.getElementById('pending-editor-dialog').close()">取消</button><button type="submit" class="crm-btn crm-btn-primary">保存待排需求</button></div></div></form></dialog>`);
+  document.getElementById('pending-editor-form').addEventListener('submit',savePendingSchedulingRecord);
+  const note=document.getElementById('ap-note').parentElement;
+  note.insertAdjacentHTML('afterend',`<div class="crm-grid" style="margin-top:16px"><div class="crm-field crm-field-full"><label for="ap-course">预约课程</label><input id="ap-course" placeholder="默认使用学员课程，可改为具体科目"></div><div class="crm-field crm-field-full"><label for="ap-unscheduled-reason">未排 / 未约原因（日报附页）</label><textarea id="ap-unscheduled-reason" rows="2" placeholder="老师档期未确认、学生时间未定等"></textarea></div><div class="crm-field crm-field-full"><label for="ap-next-action">后续安排 / 跟进动作</label><textarea id="ap-next-action" rows="2"></textarea></div><div class="crm-field"><label for="ap-followup-date">下次跟进日期</label><input id="ap-followup-date" type="date"></div></div>`);
+  document.getElementById('ap-student-select').addEventListener('change',()=>{const s=students.find(s=>String(s.id)===document.getElementById('ap-student-select').value);document.getElementById('ap-course').value=s?.course||'';});
+  document.addEventListener('click',event=>{
+    const button=event.target.closest('[data-pending-action]');if(!button)return;
+    const ap=appointments.find(a=>String(a.id)===button.dataset.id);if(!ap)return;
+    if(button.dataset.pendingAction==='edit')openPendingSchedulingRecord(ap.id);
+    if(button.dataset.pendingAction==='schedule'){switchTab('appointments');showAppointmentModal(ap.id);}
+    if(button.dataset.pendingAction==='cancel'&&confirm(`取消 ${ap.studentName} 的这条预约？取消后保留预约历史，并移出待排清单。`)){ap.status='已取消';persist();crmToast('预约已取消。');}
+  });
+}
+installPendingSchedulingUI();
+const pendingOriginalShowAppointmentModal=showAppointmentModal;
+showAppointmentModal=function(id=null){pendingOriginalShowAppointmentModal(id);const ap=appointments.find(a=>String(a.id)===String(id));const s=students.find(s=>String(s.id)===document.getElementById('ap-student-select').value);document.getElementById('ap-course').value=ap?.course||s?.course||'';document.getElementById('ap-unscheduled-reason').value=ap?.unscheduledReason||'';document.getElementById('ap-next-action').value=ap?.nextAction||'';document.getElementById('ap-followup-date').value=crmDate(ap?.followupDate);};
+const pendingOriginalUpdateAllViews=updateAllViews;
+updateAllViews=function(){pendingOriginalUpdateAllViews();renderPendingSchedulingViews();};
+const pendingOriginalSwitchTab=switchTab;
+switchTab=function(tabId){pendingOriginalSwitchTab(tabId);document.getElementById('tab-unscheduled').classList.toggle('hidden',tabId!=='unscheduled');const nav=document.getElementById('nav-unscheduled');nav.classList.toggle('bg-blue-600',tabId==='unscheduled');nav.classList.toggle('text-white',tabId==='unscheduled');nav.classList.toggle('text-slate-300',tabId!=='unscheduled');nav.classList.toggle('hover:bg-slate-800',tabId!=='unscheduled');if(tabId==='unscheduled')renderPendingSchedulingViews();};
+renderPendingSchedulingViews();
